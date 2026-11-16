@@ -1,0 +1,26 @@
+{
+    "name": "@specs-feup/onnx-flow-atlas",
+    "version": "0.1.0",
+    "type": "module",
+    "bin": {
+        "onnx-flow-atlas": "./out/src/index.js"
+    },
+    "scripts": {
+        "build": "tsc",
+        "start": "node out/src/index.js",
+        "use:local": "npm link --force ../onnx-flow",
+        "use:npm": "npm unlink --no-save @specs-feup/onnx-flow && npm install",
+        "snapshot": "npm run build && node out/src/index.js",
+        "snapshot:all": "npm run build && node out/src/snapshot.js atlas"
+    },
+    "dependencies": {
+        "@specs-feup/onnx-flow": "file:../onnx-flow",
+        "node-graphviz": "^0.1.1",
+        "yargs": "^17.7.2"
+    },
+    "devDependencies": {
+        "@types/node": "^20.19.43",
+        "@types/yargs": "^17.0.32",
+        "typescript": "^5.4.0"
+    }
+}
