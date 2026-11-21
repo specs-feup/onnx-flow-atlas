@@ -58,7 +58,7 @@ export async function runCli(rawArgs: string[] = hideBin(process.argv)): Promise
 
     if (argv.verifyDynamic) {
         const verifier = new DynamicProbeVerifier();
-        verifier.verifyCanonicalizationRecipes(recipes);
+        verifier.verifyAllRecipes(recipes);
     }
 
     const report = analyzer.analyze(profile, recipes);

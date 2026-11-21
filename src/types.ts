@@ -34,6 +34,34 @@ export const BUILTIN_PROFILES: Record<string, HardwareProfile> = {
     },
 };
 
+/** Dimensionality stratification for ONNX operators */
+export type TensorRankBucket = "0D" | "1D" | "2D" | "ND" | "unknown";
+
+/** Separates neural-network compute from loop indexing, control flow, memory, and zero-cost views */
+export type OpRole = "compute" | "indexing" | "control" | "memory" | "view";
+
+export interface OpQuantityEntry {
+    readonly opType: string;
+    readonly rank: TensorRankBucket;
+    readonly role: OpRole;
+    readonly count: number;
+    /** True when emitted inside a Loop / If region (loopDepth > 0) */
+    readonly inLoop: boolean;
+    /** True when count comes from static declaredProducedOps (lower-bound estimate of 1) */
+    readonly estimated: boolean;
+}
+
+export interface DynamicProbeResult {
+    readonly testedOp: string;
+    readonly probeInputSummary: string;
+    readonly succeeded: boolean;
+    readonly actualProducedOps: string[];
+    readonly emittedEntries: OpQuantityEntry[];
+    readonly undeclaredOps: string[]; // Emitted in graph, missing from recipe.producedOps
+    readonly unobservedOps: string[]; // Listed in recipe.producedOps, not emitted in static test
+    readonly error?: string;
+}
+
 export interface AnalyzedRecipe {
     readonly name: string;
     readonly rawTarget: string | OpCategory;
@@ -44,15 +72,10 @@ export interface AnalyzedRecipe {
     readonly exposesControlFlow: boolean;
     readonly exposesDataAccess: boolean;
     readonly declaredProducedOps: string[];
-    /** Populated if dynamic verification is enabled */
-    dynamicAudit?: {
-        testedOp: string;
-        succeeded: boolean;
-        actualProducedOps: string[];
-        undeclaredOps: string[]; // Emitted in graph, missing from recipe.producedOps
-        unobservedOps: string[]; // Listed in recipe.producedOps, not emitted in static test
-        error?: string;
-    };
+    /** Backwards-compatible primary probe result (targetOps[0]) */
+    dynamicAudit?: DynamicProbeResult;
+    /** Per-operator probe results keyed by opType (essential for category-wide recipes) */
+    dynamicAuditsByOp?: Record<string, DynamicProbeResult>;
 }
 
 export type OpCoverageStatus =
@@ -61,6 +84,68 @@ export type OpCoverageStatus =
     | "fully-lowerable-approx" // Can be transitively lowered to native primitives (uses >=1 approximation)
     | "partial-or-blocked"     // Has a recipe, but its transitive outputs hit a dead-end gap op
     | "unhandled-gap";         // Not native and has no recipe at all
+
+export interface DirectDecompositionDetail {
+    readonly recipeName: string;
+    readonly phase: RecipePhase;
+    readonly precision: RecipePrecision;
+    readonly exposesControlFlow: boolean;
+    readonly exposesDataAccess: boolean;
+    readonly provenance: "dynamic-probe" | "static-declared";
+    readonly probeInputSummary?: string;
+    readonly emittedNodes: OpQuantityEntry[];
+    readonly totalNodes: number;
+    readonly scalarComputeCount: number;
+    readonly nonScalarComputeCount: number;
+}
+
+export interface RankBreakdown {
+    readonly "0D": number;
+    readonly "1D": number;
+    readonly "2D": number;
+    readonly "ND": number;
+    readonly unknown: number;
+}
+
+export interface ReachableTerminalSet {
+    readonly id: string;
+    readonly recipeChain: string[];
+    readonly precision: RecipePrecision;
+    readonly ops: OpQuantityEntry[];
+    readonly totalOps: number;
+    readonly computeByRank: RankBreakdown;
+    readonly scalarComputeCount: number;
+    readonly nonScalarComputeCount: number;
+    readonly indexingScalarCount: number;
+    readonly controlMemoryViewCount: number;
+    /** Ratio of 0D compute ops to total compute ops (1.0 if no compute ops remain) */
+    readonly scalarComputeRatio: number;
+    /** True if all remaining compute ops are 0D and no non-native blocking gaps remain */
+    readonly reachesFullScalar: boolean;
+    readonly blockingGaps: string[];
+    readonly residualNonScalarCompute: OpQuantityEntry[];
+    readonly hasEstimatedCounts: boolean;
+}
+
+export type ScalarReadinessStatus =
+    | "full-scalar-exact"
+    | "full-scalar-approx"
+    | "scalar-blocked-non-native"
+    | "partial-scalar"
+    | "non-scalar-or-blocked";
+
+export interface PerOperatorAtlasEntry {
+    readonly opType: string;
+    readonly category?: string;
+    readonly directDecompositions: DirectDecompositionDetail[];
+    readonly terminalSets: ReachableTerminalSet[];
+    readonly truncatedTerminalSets: boolean;
+    readonly scalarReadiness: ScalarReadinessStatus;
+    readonly bestScalarComputeRatio: number;
+    readonly bestTerminalSetId?: string;
+    readonly bestBlockingGaps: string[];
+    readonly bestResidualNonScalar: OpQuantityEntry[];
+}
 
 export interface OperatorAnalysis {
     readonly opType: string;
@@ -80,6 +165,8 @@ export interface OperatorAnalysis {
     /** Maximum lowering depth to reach leaf operations */
     readonly maxLoweringDepth: number;
     readonly status: OpCoverageStatus;
+    /** Populated for all operators that have at least one direct decomposition recipe */
+    readonly atlasDetail?: PerOperatorAtlasEntry;
 }
 
 export interface UnimplementedSummary {

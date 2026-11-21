@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 import fs from "fs";
 import path from "path";
 import { graphviz } from "node-graphviz";
@@ -16,15 +15,16 @@ async function renderDotAndSvg(basePath: string, dotContent: string): Promise<vo
 
 export async function generateFullSnapshot(outDir: string = "atlas"): Promise<void> {
     const treesDir = path.join(outDir, "trees");
+    fs.rmSync(treesDir, { recursive: true, force: true });
     fs.mkdirSync(treesDir, { recursive: true });
 
     console.log(`[Snapshot] Initializing analyzer and running dynamic recipe probes...`);
     const analyzer = new RecipeGraphAnalyzer();
     const recipes = analyzer.loadRecipes();
 
-    // Run dynamic verification once and reuse across all reports
+    // Run dynamic verification across BOTH canonicalization and loop-lowering recipes
     const verifier = new DynamicProbeVerifier();
-    verifier.verifyCanonicalizationRecipes(recipes);
+    verifier.verifyAllRecipes(recipes);
 
     // 1. Analyze Scalar CGRA Profile (Primary)
     console.log(`[Snapshot] Generating Scalar-CGRA full report & maps...`);
@@ -65,22 +65,35 @@ export async function generateFullSnapshot(outDir: string = "atlas"): Promise<vo
         DotFormatter.toDot(dspReport, { includeLoopLowering: true }),
     );
 
-    // 4. Automatically generate Per-Operator Lowering Trees for all Canonicalization Ops
-    const canonOps = Array.from(
-        new Set(
-            recipes
-                .filter((r) => r.phase === "canonicalization")
-                .flatMap((r) => r.targetOps),
-        ),
-    ).sort();
+    // 4. Generate Per-Operator Lowering Trees & Text Breakdowns for ALL Decomposable Ops
+    const decomposableOps = Array.from(cgraReport.operators.values())
+        .filter((o) => o.atlasDetail !== undefined)
+        .map((o) => o.opType)
+        .sort();
 
-    console.log(`[Snapshot] Rendering ${canonOps.length} per-operator lowering trees...`);
-    for (const op of canonOps) {
+    console.log(
+        `[Snapshot] Rendering ${decomposableOps.length} per-operator lowering trees & breakdowns...`,
+    );
+    for (const op of decomposableOps) {
         const opDot = DotFormatter.toDot(cgraReport, {
             rootOp: op,
             includeLoopLowering: true,
         });
         await renderDotAndSvg(path.join(treesDir, op), opDot);
+
+        const opInfo = cgraReport.operators.get(op)!;
+        if (opInfo.atlasDetail) {
+            const mdLines = [
+                `# \`${op}\` — Decomposition & Scalar Lowering Atlas`,
+                ``,
+                `[← Back to Atlas Index](../README.md)`,
+                ``,
+                `![${op} Lowering Tree](./${op}.svg)`,
+                ``,
+                ...MarkdownReporter.renderOperatorDetail(opInfo.atlasDetail),
+            ];
+            fs.writeFileSync(path.join(treesDir, `${op}.md`), mdLines.join("\n"), "utf8");
+        }
     }
 
     // 5. Generate Master Index (atlas/README.md) for instant GitHub browsing
@@ -94,22 +107,26 @@ export async function generateFullSnapshot(outDir: string = "atlas"): Promise<vo
         `- [**Algebraic Canonicalization Map (No Loops)**](./02_canonicalization_only.svg) ([DOT](./02_canonicalization_only.dot))`,
         `- [**Vector-DSP Comparison Report**](./03_vector_dsp_report.md) ([Full SVG Map](./03_vector_dsp_atlas.svg) | [DOT](./03_vector_dsp_atlas.dot))`,
         ``,
-        `## Per-Operator Lowering Trees (${canonOps.length} Operators)`,
-        `| Operator | Status (\`scalar-cgra\`) | Precision | Max Depth | Blocking Gaps | Lowering Tree |`,
-        `| :--- | :--- | :---: | :---: | :--- | :---: |`,
+        `## Per-Operator Lowering Atlas (${decomposableOps.length} Decomposable Operators)`,
+        `| Operator | Status (\`scalar-cgra\`) | Scalar (\`0D\`) Readiness | Best \`0D\` Ratio | Max Depth | Blocking Gaps | Breakdown & Tree |`,
+        `| :--- | :--- | :--- | :---: | :---: | :--- | :---: |`,
     ];
 
-    for (const op of canonOps) {
+    for (const op of decomposableOps) {
         const info = cgraReport.operators.get(op)!;
-        const precisionBadge = info.requiresApproximation ? "≈ Approx" : "Exact";
+        const detail = info.atlasDetail!;
+        const ratioPct = `${(detail.bestScalarComputeRatio * 100).toFixed(0)}%`;
         const gaps = info.blockingLeafGaps.map((g) => `\`${g}\``).join(", ") || "None";
+
         indexLines.push(
-            `| \`${op}\` | **${info.status}** | ${precisionBadge} | ${info.maxLoweringDepth} | ${gaps} | [View SVG](./trees/${op}.svg) / [DOT](./trees/${op}.dot) |`,
+            `| \`${op}\` | **${info.status}** | ${detail.scalarReadiness} | **${ratioPct}** | ${info.maxLoweringDepth} | ${gaps} | [Text](./trees/${op}.md) · [SVG](./trees/${op}.svg) · [DOT](./trees/${op}.dot) |`,
         );
     }
 
     fs.writeFileSync(path.join(outDir, "README.md"), indexLines.join("\n"), "utf8");
-    console.log(`[Snapshot] Complete! All artifacts written to ./${outDir}/ (open ./${outDir}/README.md)`);
+    console.log(
+        `[Snapshot] Complete! All artifacts written to ./${outDir}/ (open ./${outDir}/README.md)`,
+    );
 }
 
 // Run if invoked directly

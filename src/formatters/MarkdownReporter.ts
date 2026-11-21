@@ -1,4 +1,9 @@
-import type { LibraryAnalysisReport } from "../types.js";
+import type {
+    LibraryAnalysisReport,
+    OpQuantityEntry,
+    PerOperatorAtlasEntry,
+    ScalarReadinessStatus,
+} from "../types.js";
 
 export class MarkdownReporter {
     public static generateReport(report: LibraryAnalysisReport): string {
@@ -8,6 +13,17 @@ export class MarkdownReporter {
         const approxCount = ops.filter((o) => o.status === "fully-lowerable-approx").length;
         const blockedCount = ops.filter((o) => o.status === "partial-or-blocked").length;
         const gapCount = ops.filter((o) => o.status === "unhandled-gap").length;
+
+        const decomposableOps = ops
+            .filter((o) => o.atlasDetail !== undefined)
+            .sort((a, b) => a.opType.localeCompare(b.opType));
+
+        const fullScalarExact = decomposableOps.filter(
+            (o) => o.atlasDetail!.scalarReadiness === "full-scalar-exact",
+        ).length;
+        const fullScalarApprox = decomposableOps.filter(
+            (o) => o.atlasDetail!.scalarReadiness === "full-scalar-approx",
+        ).length;
 
         const lines: string[] = [
             `# ONNX-Flow Decomposition Library Analysis`,
@@ -24,6 +40,7 @@ export class MarkdownReporter {
             `| **Fully Lowerable (Approximation)** | ${approxCount} |`,
             `| **Partially Lowered (Blocked by Downstream Gaps)** | ${blockedCount} |`,
             `| **Unhandled Gap Operators (No Recipe & Not Native)** | ${gapCount} |`,
+            `| **Decomposable Ops Reaching 100% Scalar (\`0D\`) Compute** | ${fullScalarExact + fullScalarApprox} / ${decomposableOps.length} (${fullScalarExact} exact, ${fullScalarApprox} approx) |`,
             `| **Algebraic Rewrite Cycles Detected** | ${report.cycles.length} |`,
             ``,
         ];
@@ -54,16 +71,48 @@ export class MarkdownReporter {
         }
         lines.push(``);
 
-        // Section 3: Operator Lowering Matrix
+        // Section 3: Reverse Index — Scalar Lowering Readiness Coverage
         lines.push(
-            `## 3. Complete Operator Lowering Matrix`,
+            `## 3. Reverse Index: Scalar (\`0D\`) Lowering Readiness`,
+            `Shows whether each decomposable operator reaches a **100% Scalar (\`0D\`) native** terminal set, or which non-native scalar / tensor ops still block it.`,
+            ``,
+            `| Operator | Scalar Readiness | Best \`0D\` Compute Ratio | Terminal Sets | Blocking Ops / Residual Non-Scalar (Best Set) | Breakdown |`,
+            `| :--- | :--- | :---: | :---: | :--- | :---: |`,
+        );
+
+        for (const op of decomposableOps) {
+            const d = op.atlasDetail!;
+            const badge = this.formatReadinessBadge(d.scalarReadiness);
+            const pct = `${(d.bestScalarComputeRatio * 100).toFixed(0)}%`;
+
+            const blockers: string[] = [];
+            if (d.bestBlockingGaps.length > 0) {
+                blockers.push(d.bestBlockingGaps.map((g) => `\`${g}\``).join(", "));
+            }
+            if (d.bestResidualNonScalar.length > 0) {
+                blockers.push(
+                    `Non-0D: ${d.bestResidualNonScalar.map((e) => this.formatOpChip(e)).join(", ")}`,
+                );
+            }
+            const blockerCell = blockers.join(" · ") || "None";
+            const anchor = `#op-${op.opType.toLowerCase()}`;
+
+            lines.push(
+                `| \`${op.opType}\` | ${badge} | **${pct}** | ${d.terminalSets.length}${d.truncatedTerminalSets ? "+" : ""} | ${blockerCell} | [Details](${anchor}) |`,
+            );
+        }
+        lines.push(``);
+
+        // Section 4: Complete Operator Lowering Matrix
+        lines.push(
+            `## 4. Complete Operator Lowering Matrix`,
             `| Operator | Status | Direct Recipes (Phase / Precision) | Max Depth | Blocking Leaf Gaps (if any) |`,
             `| :--- | :--- | :--- | :---: | :--- |`,
         );
 
         for (const op of ops.sort((a, b) => a.opType.localeCompare(b.opType))) {
             if (op.directRecipes.length === 0 && op.producedByRecipes.length === 0 && !op.isNativePrimitive) {
-                continue; // Skip unreferenced schema ops to keep table focused
+                continue;
             }
             const recipeBadges =
                 op.directRecipes
@@ -81,13 +130,13 @@ export class MarkdownReporter {
         }
         lines.push(``);
 
-        // Section 4: Dynamic Audit Results (if run)
+        // Section 5: Dynamic Audit Results (if run)
         const audited = report.recipes.filter((r) => r.dynamicAudit !== undefined);
         if (audited.length > 0) {
             lines.push(
-                `## 4. Dynamic Synthetic Graph Audit (\`producedOps\` Verification)`,
-                `| Recipe | Tested Op | Execution | Undeclared Ops (Emitted but missing in \`producedOps\`) | Unobserved Ops (In \`producedOps\` but not emitted) |`,
-                `| :--- | :--- | :---: | :--- | :--- |`,
+                `## 5. Dynamic Synthetic Graph Audit (\`producedOps\` Verification)`,
+                `| Recipe | Phase | Tested Op | Execution | Undeclared Ops (Emitted, missing in \`producedOps\`) | Unobserved Ops (Declared, not emitted) |`,
+                `| :--- | :---: | :--- | :---: | :--- | :--- |`,
             );
             for (const rec of audited) {
                 const a = rec.dynamicAudit!;
@@ -95,29 +144,163 @@ export class MarkdownReporter {
                 const undeclared = a.undeclaredOps.map((o) => `\`${o}\``).join(", ") || "None";
                 const unobserved = a.unobservedOps.map((o) => `\`${o}\``).join(", ") || "None";
                 lines.push(
-                    `| \`${rec.name}\` | \`${a.testedOp}\` | ${statusStr} | ${undeclared} | ${unobserved} |`,
+                    `| \`${rec.name}\` | ${rec.phase === "canonicalization" ? "Canon" : "Loop"} | \`${a.testedOp}\` | ${statusStr} | ${undeclared} | ${unobserved} |`,
                 );
             }
             lines.push(``);
         }
 
-        // Section 5: Unimplemented Standard ONNX Operators (Categorized with Ratio)
+        // Section 6: Per-Operator Decomposition & Reachable Terminal Sets
+        lines.push(
+            `## 6. Per-Operator Decomposition & Reachable Terminal Sets`,
+            `Detailed text breakdown for all **${decomposableOps.length}** operators with at least one decomposition recipe. Rank tags: \`0D\` (Scalar), \`1D\` (Vector), \`2D\` (Matrix), \`ND\` (3D+ Tensor), \`?\` (Static/Unknown). \`(in Loop)\` marks ops emitted inside loop regions; \`~\` marks static lower-bound counts when no dynamic probe succeeded.`,
+            ``,
+        );
+
+        for (const op of decomposableOps) {
+            lines.push(...this.renderOperatorDetail(op.atlasDetail!));
+        }
+
+        // Section 7: Unimplemented Standard ONNX Operators
         const summary = report.unimplementedSummary;
         if (summary.unimplementedCount > 0) {
             const ratioPercent = ((summary.unimplementedCount / summary.totalStandardOps) * 100).toFixed(1);
             lines.push(
-                `## 5. Unimplemented Standard ONNX Operators`,
+                `## 7. Unimplemented Standard ONNX Operators`,
                 `**${summary.unimplementedCount} out of ${summary.totalStandardOps}** standard ONNX specification operators (**${ratioPercent}%**) currently have **zero decomposition recipes** and are not marked as native primitives in \`${report.profile.name}\`.`,
                 ``,
             );
 
-            for (const [category, ops] of Object.entries(summary.byCategory).sort()) {
-                lines.push(`### Category: ${category} (${ops.length})`);
-                const opList = ops.map((op) => `\`${op}\``).join(", ");
-                lines.push(`> ${opList}`, ``);
+            for (const [category, opNames] of Object.entries(summary.byCategory).sort()) {
+                lines.push(`### Category: ${category} (${opNames.length})`);
+                lines.push(`> ${opNames.map((o) => `\`${o}\``).join(", ")}`, ``);
             }
         }
 
         return lines.join("\n");
+    }
+
+    /**
+     * Renders a standalone Markdown breakdown for a single operator (usable both in the main report and per-op files).
+     */
+    public static renderOperatorDetail(detail: PerOperatorAtlasEntry): string[] {
+        const lines: string[] = [
+            `<a id="op-${detail.opType.toLowerCase()}"></a>`,
+            `### \`${detail.opType}\`${detail.category ? ` *(${detail.category})*` : ""} — ${this.formatReadinessBadge(detail.scalarReadiness)}`,
+            ``,
+            `**Direct Decompositions (${detail.directDecompositions.length})**`,
+        ];
+
+        detail.directDecompositions.forEach((d, idx) => {
+            const phaseLabel = d.phase === "canonicalization" ? "Canonicalization" : "Loop Lowering";
+            const precLabel = d.precision === "approximation" ? "≈Approx" : "Exact";
+            const provLabel =
+                d.provenance === "dynamic-probe"
+                    ? `Dynamic Probe (${d.probeInputSummary})`
+                    : `Static Declared`;
+
+            lines.push(
+                `${idx + 1}. **\`${d.recipeName}\`** — *${phaseLabel}, ${precLabel}* · Source: ${provLabel}`,
+            );
+
+            const computeNodes = d.emittedNodes.filter((e) => e.role === "compute");
+            const indexingNodes = d.emittedNodes.filter((e) => e.role === "indexing");
+            const infraNodes = d.emittedNodes.filter(
+                (e) => e.role === "control" || e.role === "memory" || e.role === "view",
+            );
+
+            if (computeNodes.length > 0) {
+                lines.push(
+                    `   - **Compute (${d.scalarComputeCount} scalar \`0D\`, ${d.nonScalarComputeCount} non-scalar):** ${computeNodes.map((e) => this.formatOpChip(e)).join(", ")}`,
+                );
+            }
+            if (indexingNodes.length > 0) {
+                lines.push(
+                    `   - **Indexing / Address Gen:** ${indexingNodes.map((e) => this.formatOpChip(e)).join(", ")}`,
+                );
+            }
+            if (infraNodes.length > 0) {
+                lines.push(
+                    `   - **Control / Memory / View:** ${infraNodes.map((e) => this.formatOpChip(e)).join(", ")}`,
+                );
+            }
+        });
+
+        lines.push(
+            ``,
+            `**Reachable Terminal Operator Sets (${detail.terminalSets.length}${detail.truncatedTerminalSets ? "+ truncated" : ""})**`,
+        );
+
+        for (const set of detail.terminalSets) {
+            const scalarPct = (set.scalarComputeRatio * 100).toFixed(0);
+            const statusTag = set.reachesFullScalar
+                ? "100% Scalar Ready"
+                : set.blockingGaps.length > 0
+                    ? `Blocked by: ${set.blockingGaps.map((g) => `\`${g}\``).join(", ")}`
+                    : `Residual Non-Scalar Compute`;
+
+            const r = set.computeByRank;
+            const rankSummary = `0D: ${r["0D"]} | 1D: ${r["1D"]} | 2D: ${r["2D"]} | ND: ${r["ND"]}${r.unknown > 0 ? ` | ?: ${r.unknown}` : ""}`;
+
+            lines.push(
+                `- **${set.id}** (${set.precision === "approximation" ? "≈Approx" : "Exact"} · **${statusTag}** · Scalar Compute: **${scalarPct}%** [${rankSummary}])`,
+            );
+            lines.push(
+                `  - *Recipes:* ${set.recipeChain.map((rc) => `\`${rc}\``).join(" → ")}`,
+            );
+
+            const scalarCompute = set.ops.filter((e) => e.role === "compute" && e.rank === "0D");
+            const tensorCompute = set.ops.filter((e) => e.role === "compute" && e.rank !== "0D");
+            const indexing = set.ops.filter((e) => e.role === "indexing");
+            const infra = set.ops.filter(
+                (e) => e.role === "control" || e.role === "memory" || e.role === "view",
+            );
+
+            if (scalarCompute.length > 0) {
+                lines.push(
+                    `  - **Scalar Compute (\`0D\`, ${set.scalarComputeCount}):** ${scalarCompute.map((e) => this.formatOpChip(e)).join(", ")}`,
+                );
+            }
+            if (tensorCompute.length > 0) {
+                lines.push(
+                    `  - **Non-Scalar Compute (${set.nonScalarComputeCount}):** ${tensorCompute.map((e) => this.formatOpChip(e)).join(", ")}`,
+                );
+            }
+            if (indexing.length > 0) {
+                lines.push(
+                    `  - **Indexing Scalars (${set.indexingScalarCount}):** ${indexing.map((e) => this.formatOpChip(e)).join(", ")}`,
+                );
+            }
+            if (infra.length > 0) {
+                lines.push(
+                    `  - **Control / Memory / View (${set.controlMemoryViewCount}):** ${infra.map((e) => this.formatOpChip(e)).join(", ")}`,
+                );
+            }
+        }
+
+        lines.push(``, `---`, ``);
+        return lines;
+    }
+
+    private static formatOpChip(e: OpQuantityEntry): string {
+        const rankLabel = e.rank === "unknown" ? "?" : e.rank;
+        const prefix = e.estimated ? "~" : "";
+        const loopTag = e.inLoop && e.role !== "control" ? " *(in Loop)*" : "";
+        return `\`${e.opType}[${rankLabel}] ×${prefix}${e.count}\`${loopTag}`;
+    }
+
+    private static formatReadinessBadge(status: ScalarReadinessStatus): string {
+        switch (status) {
+            case "full-scalar-exact":
+                return "**100% Scalar (Exact)**";
+            case "full-scalar-approx":
+                return "**100% Scalar (≈Approx)**";
+            case "scalar-blocked-non-native":
+                return "0D Scalar (Non-Native Gaps)";
+            case "partial-scalar":
+                return "Partial Scalar";
+            case "non-scalar-or-blocked":
+                return "Non-Scalar / Blocked";
+        }
     }
 }
