@@ -25,6 +25,16 @@ export class MarkdownReporter {
             (o) => o.atlasDetail!.scalarReadiness === "full-scalar-approx",
         ).length;
 
+        const dynamicShapeCount = decomposableOps.filter(
+            (o) => o.bestShapeSupport === "dynamic",
+        ).length;
+        const dynamicBatchCount = decomposableOps.filter(
+            (o) => o.bestShapeSupport === "dynamic-batch",
+        ).length;
+        const staticOnlyCount = decomposableOps.filter(
+            (o) => o.bestShapeSupport === "static",
+        ).length;
+
         const lines: string[] = [
             `# ONNX-Flow Decomposition Library Analysis`,
             ``,
@@ -41,6 +51,7 @@ export class MarkdownReporter {
             `| **Partially Lowered (Blocked by Downstream Gaps)** | ${blockedCount} |`,
             `| **Unhandled Gap Operators (No Recipe & Not Native)** | ${gapCount} |`,
             `| **Decomposable Ops Reaching 100% Scalar (\`0D\`) Compute** | ${fullScalarExact + fullScalarApprox} / ${decomposableOps.length} (${fullScalarExact} exact, ${fullScalarApprox} approx) |`,
+            `| **Shape Generality (Decomposable Ops)** | ${dynamicShapeCount} dynamic, ${dynamicBatchCount} dynamic-batch, ${staticOnlyCount} static-only |`,
             `| **Algebraic Rewrite Cycles Detected** | ${report.cycles.length} |`,
             ``,
         ];
@@ -106,8 +117,8 @@ export class MarkdownReporter {
         // Section 4: Complete Operator Lowering Matrix
         lines.push(
             `## 4. Complete Operator Lowering Matrix`,
-            `| Operator | Status | Direct Recipes (Phase / Precision) | Max Depth | Blocking Leaf Gaps (if any) |`,
-            `| :--- | :--- | :--- | :---: | :--- |`,
+            `| Operator | Status | Shape Support | Direct Recipes (Phase / Precision / Priority) | Max Depth | Blocking Leaf Gaps (if any) |`,
+            `| :--- | :--- | :---: | :--- | :---: | :--- |`,
         );
 
         for (const op of ops.sort((a, b) => a.opType.localeCompare(b.opType))) {
@@ -118,14 +129,15 @@ export class MarkdownReporter {
                 op.directRecipes
                     .map(
                         (r) =>
-                            `\`${r.name}\` (${r.phase === "canonicalization" ? "Canon" : "Loop"}, ${r.precision === "approximation" ? "≈Approx" : "Exact"})`,
+                            `\`${r.name}\` (${r.phase === "canonicalization" ? "Canon" : "Loop"}, ${r.precision === "approximation" ? "≈Approx" : "Exact"}, p=${r.priority}, ${r.shapeSupport})`,
                     )
                     .join("<br>") || "—";
 
+            const shapeCol = op.bestShapeSupport ?? "—";
             const gaps = op.blockingLeafGaps.map((g) => `\`${g}\``).join(", ") || "None";
 
             lines.push(
-                `| \`${op.opType}\` | **${op.status}** | ${recipeBadges} | ${op.maxLoweringDepth} | ${gaps} |`,
+                `| \`${op.opType}\` | **${op.status}** | ${shapeCol} | ${recipeBadges} | ${op.maxLoweringDepth} | ${gaps} |`,
             );
         }
         lines.push(``);
@@ -194,13 +206,15 @@ export class MarkdownReporter {
         detail.directDecompositions.forEach((d, idx) => {
             const phaseLabel = d.phase === "canonicalization" ? "Canonicalization" : "Loop Lowering";
             const precLabel = d.precision === "approximation" ? "≈Approx" : "Exact";
+            const tagsPart =
+                d.tags.length > 0 ? ` · Tags: ${d.tags.map((t) => `\`${t}\``).join(", ")}` : "";
             const provLabel =
                 d.provenance === "dynamic-probe"
                     ? `Dynamic Probe (${d.probeInputSummary})`
                     : `Static Declared`;
 
             lines.push(
-                `${idx + 1}. **\`${d.recipeName}\`** — *${phaseLabel}, ${precLabel}* · Source: ${provLabel}`,
+                `${idx + 1}. **\`${d.recipeName}\`** — *${phaseLabel}, ${precLabel}, p=${d.priority}, ${d.shapeSupport}*${tagsPart} · Source: ${provLabel}`,
             );
 
             const computeNodes = d.emittedNodes.filter((e) => e.role === "compute");

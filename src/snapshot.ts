@@ -108,18 +108,19 @@ export async function generateFullSnapshot(outDir: string = "atlas"): Promise<vo
         `- [**Vector-DSP Comparison Report**](./03_vector_dsp_report.md) ([Full SVG Map](./03_vector_dsp_atlas.svg) | [DOT](./03_vector_dsp_atlas.dot))`,
         ``,
         `## Per-Operator Lowering Atlas (${decomposableOps.length} Decomposable Operators)`,
-        `| Operator | Status (\`scalar-cgra\`) | Scalar (\`0D\`) Readiness | Best \`0D\` Ratio | Max Depth | Blocking Gaps | Breakdown & Tree |`,
-        `| :--- | :--- | :--- | :---: | :---: | :--- | :---: |`,
+        `| Operator | Status (\`scalar-cgra\`) | Scalar (\`0D\`) Readiness | Shape Support | Best \`0D\` Ratio | Max Depth | Blocking Gaps | Breakdown & Tree |`,
+        `| :--- | :--- | :--- | :---: | :---: | :---: | :--- | :---: |`,
     ];
 
     for (const op of decomposableOps) {
         const info = cgraReport.operators.get(op)!;
         const detail = info.atlasDetail!;
         const ratioPct = `${(detail.bestScalarComputeRatio * 100).toFixed(0)}%`;
+        const shapeCol = info.bestShapeSupport ?? "—";
         const gaps = info.blockingLeafGaps.map((g) => `\`${g}\``).join(", ") || "None";
 
         indexLines.push(
-            `| \`${op}\` | **${info.status}** | ${detail.scalarReadiness} | **${ratioPct}** | ${info.maxLoweringDepth} | ${gaps} | [Text](./trees/${op}.md) · [SVG](./trees/${op}.svg) · [DOT](./trees/${op}.dot) |`,
+            `| \`${op}\` | **${info.status}** | ${detail.scalarReadiness} | ${shapeCol} | **${ratioPct}** | ${info.maxLoweringDepth} | ${gaps} | [Text](./trees/${op}.md) · [SVG](./trees/${op}.svg) · [DOT](./trees/${op}.dot) |`,
         );
     }
 

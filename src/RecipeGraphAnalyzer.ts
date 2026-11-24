@@ -6,6 +6,7 @@ import {
     getRecipeMetadata,
     type BaseRecipe,
     type OpSchema,
+    RecipeShapeSupport,
 } from "@specs-feup/onnx-flow";
 import type {
     AnalyzedRecipe,
@@ -26,14 +27,26 @@ import type {
 
 const OPSET_VERSION = 19;
 const MAX_TERMINAL_SETS = 12;
+
 const CONTROL_OPS = new Set(["Loop", "If", "Scan"]);
+
 const MEMORY_OPS = new Set([
     "Gather", "ScatterElements", "ScatterND", "GatherND", "GatherElements",
 ]);
+
 const VIEW_OPS = new Set([
     "Reshape", "Squeeze", "Unsqueeze", "Identity",
-    "Constant", "ConstantOfShape", "Shape", "Size", "Transpose",
+    "Constant", "ConstantOfShape", "Shape", "Size",
 ]);
+
+/** Ops in OpCategory.Reduction that are explicitly excluded by LowerReduction / LowerDynamicReduction */
+const NON_LOOP_REDUCTION_OPS = new Set(["ArgMax", "ArgMin", "TopK"]);
+
+const SHAPE_SUPPORT_RANK: Record<RecipeShapeSupport, number> = {
+    static: 1,
+    "dynamic-batch": 2,
+    dynamic: 3,
+};
 
 export class RecipeGraphAnalyzer {
     private categoryToOps = new Map<OpCategory, string[]>();
@@ -106,10 +119,13 @@ export class RecipeGraphAnalyzer {
     public loadRecipes(): AnalyzedRecipe[] {
         const instances: { recipe: BaseRecipe; explicitPhase: "canonicalization" | "loop-lowering" }[] = [];
 
-        for (const RecipeClass of Object.values(Recipes.canonicalization)) {
+        const canonRegistry: Record<string, new () => BaseRecipe> = Recipes.canonicalization;
+        const loopRegistry: Record<string, new () => BaseRecipe> = Recipes.loopLowering;
+
+        for (const RecipeClass of Object.values(canonRegistry)) {
             instances.push({ recipe: new RecipeClass(), explicitPhase: "canonicalization" });
         }
-        for (const RecipeClass of Object.values(Recipes.loopLowering)) {
+        for (const RecipeClass of Object.values(loopRegistry)) {
             instances.push({ recipe: new RecipeClass(), explicitPhase: "loop-lowering" });
         }
 
@@ -119,17 +135,23 @@ export class RecipeGraphAnalyzer {
             const meta = getRecipeMetadata(recipe);
             const rawTarget = meta.targetOp;
 
-            // Expand any OpCategory enum value (all 9 categories) into its concrete ONNX op names
-            const targetOps = allCategories.has(String(rawTarget))
+            let targetOps = allCategories.has(String(rawTarget))
                 ? (this.categoryToOps.get(rawTarget as OpCategory) ?? [String(rawTarget)])
                 : [String(rawTarget)];
+
+            if (rawTarget === OpCategory.Reduction) {
+                targetOps = targetOps.filter((op) => !NON_LOOP_REDUCTION_OPS.has(op));
+            }
 
             return {
                 name: meta.name,
                 rawTarget,
                 targetOps,
-                phase: recipe.phase ?? explicitPhase,
+                phase: meta.phase ?? explicitPhase,
                 precision: meta.precision,
+                priority: meta.priority,
+                shapeSupport: meta.shapeSupport,
+                tags: meta.tags,
                 exposesControlFlow: meta.exposesControlFlow,
                 exposesDataAccess: meta.exposesDataAccess,
                 declaredProducedOps: meta.producedOps,
@@ -203,6 +225,15 @@ export class RecipeGraphAnalyzer {
                 producedByMap.set(prodOp, producers);
             }
         }
+        for (const list of directRecipesByOp.values()) {
+            list.sort((a, b) => {
+                if (a.phase !== b.phase) {
+                    return a.phase === "canonicalization" ? -1 : 1;
+                }
+                if (b.priority !== a.priority) return b.priority - a.priority;
+                return a.name.localeCompare(b.name);
+            });
+        }
         for (const prim of profile.nativePrimitives) {
             allOps.add(prim);
         }
@@ -257,8 +288,7 @@ export class RecipeGraphAnalyzer {
                             dependentsCount.get(nextOp)?.add(op);
                         }
 
-                        // Self-reference inside loop lowering (e.g. ElementWise Add lowered into Loop + scalar Add)
-                        if (nextOp === currentOp && rec.phase === "loop-lowering") {
+                        if (nextOp === currentOp && rec.name === "LowerElementWise") {
                             leafOps.add(nextOp);
                             continue;
                         }
@@ -317,7 +347,7 @@ export class RecipeGraphAnalyzer {
             operators.set(op, { ...analysis, transitiveDependentCount: depCount });
         }
 
-        // 5. Build Per-Operator Atlas Details (Direct Decompositions + Reachable Terminal Sets + Scalar Readiness)
+        // 5. Build Per-Operator Atlas Details and reconcile best-path coverage status
         for (const [op, analysis] of operators.entries()) {
             if (analysis.directRecipes.length > 0) {
                 const atlasDetail = this.buildPerOperatorAtlas(
@@ -326,7 +356,42 @@ export class RecipeGraphAnalyzer {
                     profile,
                     directRecipesByOp,
                 );
-                operators.set(op, { ...analysis, atlasDetail });
+
+                const bestShapeSupport = analysis.directRecipes.reduce<RecipeShapeSupport>(
+                    (best, rec) =>
+                        SHAPE_SUPPORT_RANK[rec.shapeSupport] > SHAPE_SUPPORT_RANK[best]
+                            ? rec.shapeSupport
+                            : best,
+                    "static",
+                );
+
+                let status = analysis.status;
+                let blockingLeafGaps = analysis.blockingLeafGaps;
+                let requiresApproximation = analysis.requiresApproximation;
+
+                if (!analysis.isNativePrimitive) {
+                    if (atlasDetail.scalarReadiness === "full-scalar-exact") {
+                        status = "fully-lowerable-exact";
+                        blockingLeafGaps = [];
+                        requiresApproximation = false;
+                    } else if (atlasDetail.scalarReadiness === "full-scalar-approx") {
+                        status = "fully-lowerable-approx";
+                        blockingLeafGaps = [];
+                        requiresApproximation = true;
+                    } else if (atlasDetail.bestBlockingGaps.length > 0) {
+                        status = "partial-or-blocked";
+                        blockingLeafGaps = atlasDetail.bestBlockingGaps;
+                    }
+                }
+
+                operators.set(op, {
+                    ...analysis,
+                    bestShapeSupport,
+                    status,
+                    blockingLeafGaps,
+                    requiresApproximation,
+                    atlasDetail,
+                });
             }
         }
 
@@ -536,6 +601,9 @@ export class RecipeGraphAnalyzer {
             recipeName: rec.name,
             phase: rec.phase,
             precision: rec.precision,
+            priority: rec.priority,
+            shapeSupport: rec.shapeSupport,
+            tags: rec.tags,
             exposesControlFlow: rec.exposesControlFlow,
             exposesDataAccess: rec.exposesDataAccess,
             provenance,

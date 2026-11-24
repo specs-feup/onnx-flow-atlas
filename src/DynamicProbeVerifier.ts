@@ -34,7 +34,7 @@ const MEMORY_OPS = new Set([
 ]);
 const VIEW_OPS = new Set([
     "Reshape", "Squeeze", "Unsqueeze", "Identity",
-    "Constant", "ConstantOfShape", "Shape", "Size", "Transpose",
+    "Constant", "ConstantOfShape", "Shape", "Size",
 ]);
 const INDEXING_ARITH_OPS = new Set([
     "Add", "Sub", "Mul", "Div", "Mod", "Floor", "Cast", "Range",
@@ -54,11 +54,16 @@ export class DynamicProbeVerifier {
         const canonMap = new Map<string, DecompositionRecipe>();
         const loopMap = new Map<string, LoopLoweringRecipe>();
 
-        for (const R of Object.values(Recipes.canonicalization)) {
+        const canonRegistry: Record<string, new () => DecompositionRecipe> =
+            Recipes.canonicalization;
+        const loopRegistry: Record<string, new () => LoopLoweringRecipe> =
+            Recipes.loopLowering;
+
+        for (const R of Object.values(canonRegistry)) {
             const inst = new R();
             canonMap.set(inst.name, inst);
         }
-        for (const R of Object.values(Recipes.loopLowering)) {
+        for (const R of Object.values(loopRegistry)) {
             const inst = new R();
             loopMap.set(inst.name, inst);
         }
@@ -90,7 +95,7 @@ export class DynamicProbeVerifier {
         testOp: string,
     ): DynamicProbeResult {
         try {
-            const { graph, opNode, probeInputSummary } = this.buildSyntheticSingleOpGraph(testOp);
+            const { graph, opNode, probeInputSummary } = this.buildSyntheticSingleOpGraph(testOp, recipe.name);
             if (!recipe.match(opNode)) {
                 return this.makeFailedResult(
                     testOp,
@@ -139,7 +144,7 @@ export class DynamicProbeVerifier {
     ): DynamicProbeResult {
         try {
             const { graph, opNode, outShape, outDtype, probeInputSummary } =
-                this.buildSyntheticSingleOpGraph(testOp);
+                this.buildSyntheticSingleOpGraph(testOp, recipe.name);
 
             if (!recipe.match(opNode)) {
                 return this.makeFailedResult(
@@ -309,7 +314,7 @@ export class DynamicProbeVerifier {
         };
     }
 
-    private buildSyntheticSingleOpGraph(opType: string) {
+    private buildSyntheticSingleOpGraph(opType: string, recipeName?: string) {
         const graph = OnnxGraph.create();
         const builder = new GraphBuilder(graph, "probe");
 
@@ -321,8 +326,10 @@ export class DynamicProbeVerifier {
 
         let inputs: ValueNode[] = [];
         let attrs: AttributeMap = {};
+        let outputNames: string[] = ["Y"];
         let outShape: number[] = [4, 4];
         let outDtype: DataType = DataType.FLOAT;
+        let regions: OnnxGraph.Class[] | undefined;
 
         switch (opType) {
             case "Gemm":
@@ -341,6 +348,30 @@ export class DynamicProbeVerifier {
                 ];
                 outShape = [4, 6];
                 break;
+            case "MatMulInteger":
+                inputs = [
+                    makeInput("A", DataType.UINT8, [4, 8]),
+                    makeInput("B", DataType.UINT8, [8, 6]),
+                    builder.createConstant("a_zp", makeTensorProto(DataType.UINT8, [], [0])),
+                    builder.createConstant("b_zp", makeTensorProto(DataType.UINT8, [], [0])),
+                ];
+                outShape = [4, 6];
+                outDtype = DataType.INT32;
+                break;
+            case "QLinearMatMul":
+                inputs = [
+                    makeInput("A", DataType.UINT8, [4, 8]),
+                    builder.createConstant("a_scale", makeTensorProto(DataType.FLOAT, [], [0.1])),
+                    builder.createConstant("a_zp", makeTensorProto(DataType.UINT8, [], [0])),
+                    makeInput("B", DataType.UINT8, [8, 6]),
+                    builder.createConstant("b_scale", makeTensorProto(DataType.FLOAT, [], [0.1])),
+                    builder.createConstant("b_zp", makeTensorProto(DataType.UINT8, [], [0])),
+                    builder.createConstant("y_scale", makeTensorProto(DataType.FLOAT, [], [0.1])),
+                    builder.createConstant("y_zp", makeTensorProto(DataType.UINT8, [], [0])),
+                ];
+                outShape = [4, 6];
+                outDtype = DataType.UINT8;
+                break;
             case "Conv":
                 inputs = [
                     makeInput("X", DataType.FLOAT, [1, 3, 8, 8]),
@@ -348,6 +379,40 @@ export class DynamicProbeVerifier {
                     makeInput("B", DataType.FLOAT, [4]),
                 ];
                 attrs = { kernel_shape: [3, 3], strides: [1, 1], pads: [0, 0, 0, 0] };
+                outShape = [1, 4, 6, 6];
+                break;
+            case "ConvInteger":
+                inputs = [
+                    makeInput("X", DataType.UINT8, [1, 3, 8, 8]),
+                    makeInput("W", DataType.UINT8, [4, 3, 3, 3]),
+                    builder.createConstant("x_zp", makeTensorProto(DataType.UINT8, [], [0])),
+                    builder.createConstant("w_zp", makeTensorProto(DataType.UINT8, [], [0])),
+                ];
+                attrs = { strides: [1, 1], pads: [0, 0, 0, 0] };
+                outShape = [1, 4, 6, 6];
+                outDtype = DataType.INT32;
+                break;
+            case "QLinearConv":
+                inputs = [
+                    makeInput("X", DataType.UINT8, [1, 3, 8, 8]),
+                    builder.createConstant("x_scale", makeTensorProto(DataType.FLOAT, [], [0.1])),
+                    builder.createConstant("x_zp", makeTensorProto(DataType.UINT8, [], [0])),
+                    makeInput("W", DataType.UINT8, [4, 3, 3, 3]),
+                    builder.createConstant("w_scale", makeTensorProto(DataType.FLOAT, [], [0.1])),
+                    builder.createConstant("w_zp", makeTensorProto(DataType.UINT8, [], [0])),
+                    builder.createConstant("y_scale", makeTensorProto(DataType.FLOAT, [], [0.1])),
+                    builder.createConstant("y_zp", makeTensorProto(DataType.UINT8, [], [0])),
+                ];
+                attrs = { strides: [1, 1], pads: [0, 0, 0, 0] };
+                outShape = [1, 4, 6, 6];
+                outDtype = DataType.UINT8;
+                break;
+            case "ConvTranspose":
+                inputs = [
+                    makeInput("X", DataType.FLOAT, [1, 3, 4, 4]),
+                    makeInput("W", DataType.FLOAT, [3, 4, 3, 3]),
+                ];
+                attrs = { strides: [1, 1], pads: [0, 0, 0, 0] };
                 outShape = [1, 4, 6, 6];
                 break;
             case "Range":
@@ -384,6 +449,13 @@ export class DynamicProbeVerifier {
                 attrs = { mode: "constant" };
                 outShape = [4, 6];
                 break;
+            case "Tile":
+                inputs = [
+                    makeInput("X", DataType.FLOAT, [2, 4]),
+                    builder.createConstant("repeats", makeTensorProto(DataType.INT64, [2], [2, 3])),
+                ];
+                outShape = [4, 12];
+                break;
             case "Expand":
                 inputs = [
                     makeInput("X", DataType.FLOAT, [1, 4]),
@@ -396,6 +468,19 @@ export class DynamicProbeVerifier {
                     makeInput("X", DataType.FLOAT, [4, 4]),
                     builder.createConstant("min", makeTensorProto(DataType.FLOAT, [], [0])),
                     builder.createConstant("max", makeTensorProto(DataType.FLOAT, [], [6])),
+                ];
+                break;
+            case "CastLike":
+                inputs = [
+                    makeInput("X", DataType.FLOAT, [4, 4]),
+                    makeInput("Target", DataType.INT32, [4, 4]),
+                ];
+                outDtype = DataType.INT32;
+                break;
+            case "PRelu":
+                inputs = [
+                    makeInput("X", DataType.FLOAT, [4, 4]),
+                    makeInput("Slope", DataType.FLOAT, [4]),
                 ];
                 break;
             case "QuantizeLinear":
@@ -412,6 +497,11 @@ export class DynamicProbeVerifier {
                     builder.createConstant("scale", makeTensorProto(DataType.FLOAT, [], [0.1])),
                     builder.createConstant("zp", makeTensorProto(DataType.UINT8, [], [0])),
                 ];
+                break;
+            case "DynamicQuantizeLinear":
+                inputs = [makeInput("X", DataType.FLOAT, [4, 4])];
+                outputNames = ["y", "y_scale", "y_zero_point"];
+                outDtype = DataType.UINT8;
                 break;
             case "BatchNormalization":
                 inputs = [
@@ -447,11 +537,162 @@ export class DynamicProbeVerifier {
                 inputs = [makeInput("X", DataType.FLOAT, [1, 4, 8, 8])];
                 attrs = { kernel_shape: [3, 3], strides: [2, 2], pads: [0, 0, 0, 0] };
                 outShape = [1, 4, 3, 3];
+                if (recipeName === "LowerMaxPoolWithIndices") {
+                    outputNames = ["Y", "Indices"];
+                }
+                break;
+            case "LpPool":
+                inputs = [makeInput("X", DataType.FLOAT, [1, 4, 8, 8])];
+                attrs = { kernel_shape: [2, 2], strides: [2, 2], p: 2 };
+                outShape = [1, 4, 4, 4];
+                break;
+            case "GlobalAveragePool":
+            case "GlobalLpPool":
+            case "GlobalMaxPool":
+                inputs = [makeInput("X", DataType.FLOAT, [1, 4, 8, 8])];
+                outShape = [1, 4, 1, 1];
                 break;
             case "Softmax":
                 inputs = [makeInput("X", DataType.FLOAT, [2, 8])];
                 attrs = { axis: -1 };
                 outShape = [2, 8];
+                break;
+            case "NegativeLogLikelihoodLoss":
+            case "SoftmaxCrossEntropyLoss":
+                inputs = [
+                    makeInput("X", DataType.FLOAT, [4, 5]),
+                    makeInput("Target", DataType.INT64, [4]),
+                ];
+                attrs = { reduction: "mean" };
+                outShape = [];
+                break;
+            case "OneHot":
+                inputs = [
+                    makeInput("Indices", DataType.INT64, [4]),
+                    builder.createConstant("depth", makeTensorProto(DataType.INT64, [], [4])),
+                    builder.createConstant("values", makeTensorProto(DataType.FLOAT, [2], [0, 1])),
+                ];
+                attrs = { axis: -1 };
+                outShape = [4, 4];
+                break;
+            case "TopK":
+                inputs = [
+                    makeInput("X", DataType.FLOAT, [4, 8]),
+                    builder.createConstant("K", makeTensorProto(DataType.INT64, [1], [3])),
+                ];
+                attrs = { axis: 1, largest: 1, sorted: 1 };
+                outputNames = ["Values", "Indices"];
+                outShape = [4, 3];
+                break;
+            case "RNN":
+                inputs = [
+                    makeInput("X", DataType.FLOAT, [3, 2, 4]),
+                    makeInput("W", DataType.FLOAT, [1, 5, 4]),
+                    makeInput("R", DataType.FLOAT, [1, 5, 5]),
+                ];
+                attrs = { hidden_size: 5 };
+                outputNames = ["Y", "Y_h"];
+                outShape = [3, 1, 2, 5];
+                break;
+            case "GRU":
+                inputs = [
+                    makeInput("X", DataType.FLOAT, [3, 2, 4]),
+                    makeInput("W", DataType.FLOAT, [1, 15, 4]),
+                    makeInput("R", DataType.FLOAT, [1, 15, 5]),
+                ];
+                attrs = { hidden_size: 5 };
+                outputNames = ["Y", "Y_h"];
+                outShape = [3, 1, 2, 5];
+                break;
+            case "LSTM":
+                inputs = [
+                    makeInput("X", DataType.FLOAT, [3, 2, 4]),
+                    makeInput("W", DataType.FLOAT, [1, 20, 4]),
+                    makeInput("R", DataType.FLOAT, [1, 20, 5]),
+                ];
+                attrs = { hidden_size: 5 };
+                outputNames = ["Y", "Y_h", "Y_c"];
+                outShape = [3, 1, 2, 5];
+                break;
+            case "Scan": {
+                inputs = [
+                    makeInput("State0", DataType.FLOAT, [2, 4]),
+                    makeInput("Seq", DataType.FLOAT, [3, 2, 4]),
+                ];
+                attrs = { num_scan_inputs: 1 };
+                outputNames = ["StateOut", "ScanOut"];
+                outShape = [2, 4];
+                const body = OnnxGraph.create();
+                const bb = new GraphBuilder(body, "scan_body");
+                const stIn = bb.createTensor("s_in", DataType.FLOAT, [2, 4], "input");
+                const xIn = bb.createTensor("x_in", DataType.FLOAT, [2, 4], "input");
+                const [stOut] = bb.createOp("Add", [stIn, xIn], {}, [{ type: DataType.FLOAT, shape: [2, 4] }]);
+                const [yOut] = bb.createOp("Identity", [stOut], {}, [{ type: DataType.FLOAT, shape: [2, 4] }]);
+                (stOut as TensorNode.Class).setType("output");
+                (yOut as TensorNode.Class).setType("output");
+                regions = [body];
+                break;
+            }
+            case "Einsum":
+                inputs = [
+                    makeInput("A", DataType.FLOAT, [4, 8]),
+                    makeInput("B", DataType.FLOAT, [8, 6]),
+                ];
+                attrs = { equation: "ij,jk->ik" };
+                outShape = [4, 6];
+                break;
+            case "CumSum":
+                inputs = [
+                    makeInput("X", DataType.FLOAT, [4, 8]),
+                    builder.createConstant("axis", makeTensorProto(DataType.INT64, [], [1])),
+                ];
+                outShape = [4, 8];
+                break;
+            case "GatherElements":
+                inputs = [
+                    makeInput("Data", DataType.FLOAT, [4, 4]),
+                    makeInput("Indices", DataType.INT64, [2, 4]),
+                ];
+                attrs = { axis: 0 };
+                outShape = [2, 4];
+                break;
+            case "GatherND":
+                inputs = [
+                    makeInput("Data", DataType.FLOAT, [4, 4]),
+                    makeInput("Indices", DataType.INT64, [2, 1]),
+                ];
+                attrs = { batch_dims: 0 };
+                outShape = [2, 4];
+                break;
+            case "Scatter":
+            case "ScatterND":
+                inputs = [
+                    makeInput("Data", DataType.FLOAT, [4, 4]),
+                    makeInput("Indices", DataType.INT64, opType === "ScatterND" ? [2, 1] : [2, 4]),
+                    makeInput("Updates", DataType.FLOAT, [2, 4]),
+                ];
+                if (opType === "Scatter") attrs = { axis: 0 };
+                outShape = [4, 4];
+                break;
+            case "Resize":
+                inputs = [
+                    makeInput("X", DataType.FLOAT, [1, 2, 4, 4]),
+                    builder.createConstant("roi", makeTensorProto(DataType.FLOAT, [0], [])),
+                    builder.createConstant("scales", makeTensorProto(DataType.FLOAT, [4], [1, 1, 2, 2])),
+                ];
+                attrs =
+                    recipeName === "LowerResizeCubic"
+                        ? { mode: "cubic", cubic_coeff_a: -0.75 }
+                        : { mode: "linear" };
+                outShape = [1, 2, 8, 8];
+                break;
+            case "ReverseSequence":
+                inputs = [
+                    makeInput("X", DataType.FLOAT, [4, 2, 3]),
+                    makeInput("SeqLens", DataType.INT64, [2]),
+                ];
+                attrs = { batch_axis: 1, time_axis: 0 };
+                outShape = [4, 2, 3];
                 break;
             case "ReduceSum":
             case "ReduceMean":
@@ -506,6 +747,9 @@ export class DynamicProbeVerifier {
                     makeInput("A", dt, [4, 4]),
                     makeInput("B", dt, [4, 4]),
                 ];
+                if (recipeName === "LowerVariadicMin" || recipeName === "LowerVariadicMax") {
+                    inputs.push(makeInput("C", dt, [4, 4]));
+                }
                 if (
                     isBool ||
                     opType === "Equal" ||
@@ -539,7 +783,20 @@ export class DynamicProbeVerifier {
                 break;
         }
 
-        builder.createOpWithExact("target_op", opType, inputs, ["Y"], attrs);
+        if (regions !== undefined) {
+            const scanOp = builder
+                .addNode("target_op", new OperationNode.Builder(opType, inputs, attrs, regions));
+            for (const inp of inputs) {
+                builder.addEdge(inp, scanOp, inp.literalType, inp.shape);
+            }
+            for (const name of outputNames) {
+                const outT = builder.createTensor(name, outDtype, outShape, "output");
+                builder.addEdge(scanOp, outT, outDtype, outShape);
+            }
+        } else {
+            builder.createOpWithExact("target_op", opType, inputs, outputNames, attrs);
+        }
+
         try {
             inferShapes(graph);
         } catch {
@@ -547,10 +804,13 @@ export class DynamicProbeVerifier {
         }
 
         const outputs = graph.getNodeById("target_op")!.outgoers.targets.toArray();
+        for (const out of outputs) {
+            if (out.is(TensorNode)) {
+                out.as(TensorNode).setType("output");
+            }
+        }
         if (outputs.length > 0 && outputs[0].is(TensorNode)) {
-            const outTensor = outputs[0].as(TensorNode);
-            outTensor.setType("output");
-            const inferred = this.extractTensorMeta(outTensor).shape;
+            const inferred = this.extractTensorMeta(outputs[0].as(TensorNode)).shape;
             if (inferred && inferred.length > 0 && !inferred.includes(-1)) {
                 outShape = inferred;
             }

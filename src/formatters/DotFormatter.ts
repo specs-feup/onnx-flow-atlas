@@ -126,7 +126,7 @@ export class DotFormatter {
 
             const recId = `rec_${rec.name}`;
             lines.push(
-                `  "${recId}" [label="${rec.name}${approxLabel}\\n[${rec.phase}]", shape=cds, style="filled${isApprox ? ",dashed" : ""}", fillcolor="${fillColor}", color="${edgeColor}", fontcolor="${edgeColor}"];`,
+                `  "${recId}" [label="${rec.name}${approxLabel}\\n[${rec.phase} | p=${rec.priority} | ${rec.shapeSupport}]", shape=cds, style="filled${isApprox ? ",dashed" : ""}", fillcolor="${fillColor}", color="${edgeColor}", fontcolor="${edgeColor}"];`,
             );
 
             for (const targetOp of rec.targetOps) {

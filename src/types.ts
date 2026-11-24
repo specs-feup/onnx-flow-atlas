@@ -1,4 +1,4 @@
-import type { RecipePhase, RecipePrecision, OpCategory } from "@specs-feup/onnx-flow";
+import type { RecipePhase, RecipePrecision, OpCategory, RecipeShapeSupport } from "@specs-feup/onnx-flow";
 
 export interface HardwareProfile {
     readonly name: string;
@@ -69,6 +69,9 @@ export interface AnalyzedRecipe {
     readonly targetOps: string[];
     readonly phase: RecipePhase;
     readonly precision: RecipePrecision;
+    readonly priority: number;
+    readonly shapeSupport: RecipeShapeSupport;
+    readonly tags: readonly string[];
     readonly exposesControlFlow: boolean;
     readonly exposesDataAccess: boolean;
     readonly declaredProducedOps: string[];
@@ -89,6 +92,9 @@ export interface DirectDecompositionDetail {
     readonly recipeName: string;
     readonly phase: RecipePhase;
     readonly precision: RecipePrecision;
+    readonly priority: number;
+    readonly shapeSupport: RecipeShapeSupport;
+    readonly tags: readonly string[];
     readonly exposesControlFlow: boolean;
     readonly exposesDataAccess: boolean;
     readonly provenance: "dynamic-probe" | "static-declared";
@@ -152,20 +158,15 @@ export interface OperatorAnalysis {
     readonly category?: string;
     readonly isNativePrimitive: boolean;
     readonly directRecipes: AnalyzedRecipe[];
-    /** Operators that directly produce this op during their decomposition */
+    /** Highest shape generality across direct recipes ("dynamic" > "dynamic-batch" > "static") */
+    readonly bestShapeSupport?: RecipeShapeSupport;
     readonly producedByRecipes: string[];
-    /** How many recipes (directly or transitively) depend on this operator */
     readonly transitiveDependentCount: number;
-    /** All leaf operators reached when decomposing this operator as far as possible */
     readonly transitiveLeafOps: string[];
-    /** Subset of transitiveLeafOps that are NOT in HardwareProfile.nativePrimitives */
     readonly blockingLeafGaps: string[];
-    /** Whether any path in the lowering tree uses an approximation recipe */
     readonly requiresApproximation: boolean;
-    /** Maximum lowering depth to reach leaf operations */
     readonly maxLoweringDepth: number;
     readonly status: OpCoverageStatus;
-    /** Populated for all operators that have at least one direct decomposition recipe */
     readonly atlasDetail?: PerOperatorAtlasEntry;
 }
 
