@@ -9,12 +9,17 @@ import {
     RecipeShapeSupport,
 } from "@specs-feup/onnx-flow";
 import type {
+    AbstractionLevelSummary,
     AnalyzedRecipe,
+    DialectHubEntry,
     DirectDecompositionDetail,
+    DynamicHierarchyReport,
     HardwareProfile,
+    LevelTransitionEdge,
     LibraryAnalysisReport,
     OpCoverageStatus,
     OperatorAnalysis,
+    OperatorHierarchyMetrics,
     OpQuantityEntry,
     OpRole,
     PerOperatorAtlasEntry,
@@ -406,6 +411,9 @@ export class RecipeGraphAnalyzer {
 
         const unimplementedSummary = this.getUnimplementedSummary(profile, recipes);
 
+        // 6. Compute fully dynamic, recipe-driven abstraction hierarchy
+        const hierarchy = this.computeDynamicHierarchy(profile, operators, directRecipesByOp);
+
         return {
             profile,
             recipes,
@@ -413,6 +421,7 @@ export class RecipeGraphAnalyzer {
             cycles,
             prioritizedGaps,
             unimplementedSummary,
+            hierarchy,
         };
     }
 
@@ -881,5 +890,397 @@ export class RecipeGraphAnalyzer {
         if (MEMORY_OPS.has(opType)) return "memory";
         if (VIEW_OPS.has(opType)) return "view";
         return "compute";
+    }
+
+    private getEffectiveProducedOps(opType: string, rec: AnalyzedRecipe): string[] {
+        const probe =
+            rec.dynamicAuditsByOp?.[opType] ??
+            (rec.dynamicAudit?.testedOp === opType ? rec.dynamicAudit : undefined);
+        if (probe && probe.succeeded && probe.actualProducedOps.length > 0) {
+            return probe.actualProducedOps;
+        }
+        return rec.declaredProducedOps;
+    }
+
+    private computeDynamicHierarchy(
+        profile: HardwareProfile,
+        operators: Map<string, OperatorAnalysis>,
+        directRecipesByOp: Map<string, AnalyzedRecipe[]>,
+    ): DynamicHierarchyReport {
+        // 1. Scope to operators actively participating in the recipe library or native profile
+        const activeOps = new Set<string>();
+        for (const [op, info] of operators.entries()) {
+            if (
+                info.isNativePrimitive ||
+                info.directRecipes.length > 0 ||
+                info.producedByRecipes.length > 0
+            ) {
+                activeOps.add(op);
+            }
+        }
+
+        // 2. Build primary-path directed graph (using highest-priority recipe per op)
+        const primaryRecipeByOp = new Map<string, AnalyzedRecipe>();
+        const primaryEdges = new Map<string, string[]>();
+
+        for (const op of activeOps) {
+            if (profile.nativePrimitives.has(op)) {
+                primaryEdges.set(op, []);
+                continue;
+            }
+            const recs = directRecipesByOp.get(op) ?? [];
+            if (recs.length === 0) {
+                primaryEdges.set(op, []);
+                continue;
+            }
+            const primary = recs[0];
+            primaryRecipeByOp.set(op, primary);
+            const deps = Array.from(
+                new Set(
+                    this.getEffectiveProducedOps(op, primary).filter(
+                        (v) => v !== op && activeOps.has(v),
+                    ),
+                ),
+            );
+            primaryEdges.set(op, deps);
+        }
+
+        // 3. Tarjan's SCC condensation on the primary-path graph (guarantees a DAG)
+        let indexCounter = 0;
+        const indices = new Map<string, number>();
+        const lowlink = new Map<string, number>();
+        const onStack = new Set<string>();
+        const stack: string[] = [];
+        const sccIdByOp = new Map<string, number>();
+        const sccs: string[][] = [];
+
+        const strongConnect = (v: string) => {
+            indices.set(v, indexCounter);
+            lowlink.set(v, indexCounter);
+            indexCounter++;
+            stack.push(v);
+            onStack.add(v);
+
+            for (const w of primaryEdges.get(v) ?? []) {
+                if (!indices.has(w)) {
+                    strongConnect(w);
+                    lowlink.set(v, Math.min(lowlink.get(v)!, lowlink.get(w)!));
+                } else if (onStack.has(w)) {
+                    lowlink.set(v, Math.min(lowlink.get(v)!, indices.get(w)!));
+                }
+            }
+
+            if (lowlink.get(v) === indices.get(v)) {
+                const sccId = sccs.length;
+                const members: string[] = [];
+                while (true) {
+                    const w = stack.pop()!;
+                    onStack.delete(w);
+                    sccIdByOp.set(w, sccId);
+                    members.push(w);
+                    if (w === v) break;
+                }
+                sccs.push(members.sort());
+            }
+        };
+
+        for (const op of Array.from(activeOps).sort()) {
+            if (!indices.has(op)) strongConnect(op);
+        }
+
+        const sccCycles = sccs.filter((members) => members.length > 1);
+
+        // 4. Bottom-up level calculation on the condensed SCC DAG
+        const sccLevelMemo = new Map<number, number>();
+        const unresolvedGaps: string[] = [];
+
+        const computeSccLevel = (sccId: number): number => {
+            if (sccLevelMemo.has(sccId)) return sccLevelMemo.get(sccId)!;
+            const members = sccs[sccId];
+
+            if (members.length === 1) {
+                const op = members[0];
+                if (profile.nativePrimitives.has(op)) {
+                    sccLevelMemo.set(sccId, 0);
+                    return 0;
+                }
+                if (!primaryRecipeByOp.has(op)) {
+                    sccLevelMemo.set(sccId, -1);
+                    return -1;
+                }
+            }
+
+            let maxChildLevel = 0;
+            for (const op of members) {
+                for (const dep of primaryEdges.get(op) ?? []) {
+                    const depScc = sccIdByOp.get(dep)!;
+                    if (depScc === sccId) continue;
+                    const depLevel = computeSccLevel(depScc);
+                    if (depLevel > maxChildLevel) {
+                        maxChildLevel = depLevel;
+                    }
+                }
+            }
+
+            const level = maxChildLevel + 1;
+            sccLevelMemo.set(sccId, level);
+            return level;
+        };
+
+        const levelByOp = new Map<string, number>();
+        let maxLevel = 0;
+
+        for (const op of Array.from(activeOps).sort()) {
+            const lvl = computeSccLevel(sccIdByOp.get(op)!);
+            levelByOp.set(op, lvl);
+            if (lvl === -1) {
+                unresolvedGaps.push(op);
+            } else if (lvl > maxLevel) {
+                maxLevel = lvl;
+            }
+        }
+
+        // 5. Compute fan-in, fan-out, and min/max level spread across alternative recipes
+        const reversePrimary = new Map<string, Set<string>>();
+        for (const op of activeOps) reversePrimary.set(op, new Set());
+        for (const [u, deps] of primaryEdges.entries()) {
+            for (const v of deps) {
+                reversePrimary.get(v)?.add(u);
+            }
+        }
+
+        const getTransitiveFanIn = (target: string): number => {
+            const visited = new Set<string>();
+            const queue = Array.from(reversePrimary.get(target) ?? []);
+            while (queue.length > 0) {
+                const curr = queue.shift()!;
+                if (visited.has(curr) || curr === target) continue;
+                visited.add(curr);
+                for (const parent of reversePrimary.get(curr) ?? []) {
+                    if (!visited.has(parent)) queue.push(parent);
+                }
+            }
+            return visited.size;
+        };
+
+        const metricsByOp = new Map<string, OperatorHierarchyMetrics>();
+
+        for (const op of activeOps) {
+            const level = levelByOp.get(op)!;
+            const sccId = sccIdByOp.get(op)!;
+            const primary = primaryRecipeByOp.get(op);
+            const directFanIn = reversePrimary.get(op)?.size ?? 0;
+            const transitiveFanIn = getTransitiveFanIn(op);
+            const directFanOut = (primaryEdges.get(op) ?? []).length;
+            const crossesIntoLoop =
+                primary !== undefined &&
+                (primary.phase === "loop-lowering" || primary.exposesControlFlow);
+
+            let minLevel = level;
+            let maxRecLevel = level;
+
+            if (level > 0) {
+                const recs = directRecipesByOp.get(op) ?? [];
+                const recLevels: number[] = [];
+                for (const rec of recs) {
+                    const deps = this.getEffectiveProducedOps(op, rec).filter(
+                        (v) => v !== op && activeOps.has(v) && sccIdByOp.get(v) !== sccId,
+                    );
+                    let maxDep = 0;
+                    for (const dep of deps) {
+                        const dl = levelByOp.get(dep) ?? 0;
+                        if (dl > maxDep) maxDep = dl;
+                    }
+                    recLevels.push(maxDep + 1);
+                }
+                if (recLevels.length > 0) {
+                    minLevel = Math.min(...recLevels);
+                    maxRecLevel = Math.max(...recLevels);
+                }
+            }
+
+            const metrics: OperatorHierarchyMetrics = {
+                level,
+                minLevel,
+                maxLevel: maxRecLevel,
+                primaryRecipe: primary?.name,
+                sccId,
+                directFanIn,
+                transitiveFanIn,
+                directFanOut,
+                crossesIntoLoop,
+            };
+            metricsByOp.set(op, metrics);
+
+            const existing = operators.get(op);
+            if (existing) {
+                operators.set(op, { ...existing, hierarchyMetrics: metrics });
+            }
+        }
+
+        // 6. Aggregate emergent strata summaries (top-down: maxLevel -> 0)
+        const levels: AbstractionLevelSummary[] = [];
+        const loopBoundaryLevels: number[] = [];
+
+        for (let k = maxLevel; k >= 0; k--) {
+            const opsAtLevel = Array.from(activeOps)
+                .filter((op) => levelByOp.get(op) === k)
+                .sort();
+            if (opsAtLevel.length === 0 && k > 0) continue;
+
+            const catCounts = new Map<string, number>();
+            let canonicalizationCount = 0;
+            let loopLoweringCount = 0;
+            let controlFlowBoundaryCount = 0;
+            let approximationCount = 0;
+            let fanInSum = 0;
+
+            for (const op of opsAtLevel) {
+                const cat = this.formatCategory(this.allSchemaOps.get(op)?.category) ?? "Other";
+                catCounts.set(cat, (catCounts.get(cat) ?? 0) + 1);
+
+                const primary = primaryRecipeByOp.get(op);
+                if (primary) {
+                    if (primary.phase === "canonicalization") canonicalizationCount++;
+                    else loopLoweringCount++;
+                    if (primary.precision === "approximation") approximationCount++;
+                }
+
+                const m = metricsByOp.get(op)!;
+                if (m.crossesIntoLoop) controlFlowBoundaryCount++;
+                fanInSum += m.transitiveFanIn;
+            }
+
+            const dominantCategories = Array.from(catCounts.entries())
+                .map(([category, count]) => ({
+                    category,
+                    count,
+                    ratio: opsAtLevel.length > 0 ? count / opsAtLevel.length : 0,
+                }))
+                .sort((a, b) => b.count - a.count || a.category.localeCompare(b.category));
+
+            const avgFanIn = opsAtLevel.length > 0 ? fanInSum / opsAtLevel.length : 0;
+
+            if (k > 0 && controlFlowBoundaryCount > 0) {
+                loopBoundaryLevels.push(k);
+            }
+
+            let signature: string;
+            if (k === 0) {
+                signature = `Target Native Sinks (${profile.name})`;
+            } else {
+                const topCats = dominantCategories
+                    .slice(0, 2)
+                    .map((c) => c.category)
+                    .join("/");
+                const totalWithRec = canonicalizationCount + loopLoweringCount;
+                const canonPct =
+                    totalWithRec > 0 ? Math.round((canonicalizationCount / totalWithRec) * 100) : 0;
+                const loopPct = 100 - canonPct;
+                const phasePart =
+                    canonPct === 100
+                        ? "100% Canon"
+                        : loopPct === 100
+                          ? "100% Loop"
+                          : `${canonPct}% Canon / ${loopPct}% Loop`;
+                const cfPart =
+                    controlFlowBoundaryCount > 0
+                        ? ` · ${controlFlowBoundaryCount} Loop-Boundary`
+                        : "";
+                const approxPart =
+                    approximationCount > 0 ? ` · ${approximationCount} Approx` : "";
+                signature = `${topCats} · ${phasePart}${cfPart}${approxPart}`;
+            }
+
+            levels.push({
+                level: k,
+                operators: opsAtLevel,
+                dominantCategories,
+                canonicalizationCount,
+                loopLoweringCount,
+                controlFlowBoundaryCount,
+                approximationCount,
+                avgFanIn,
+                signature,
+            });
+        }
+
+        // 7. Identify Convergence Hubs (intermediate ops 0 < level < maxLevel)
+        const convergenceHubs: DialectHubEntry[] = Array.from(activeOps)
+            .filter((op) => {
+                const lvl = levelByOp.get(op)!;
+                const m = metricsByOp.get(op)!;
+                return lvl > 0 && lvl < maxLevel && m.transitiveFanIn > 0;
+            })
+            .map((op) => {
+                const m = metricsByOp.get(op)!;
+                return {
+                    opType: op,
+                    level: m.level,
+                    category: this.formatCategory(this.allSchemaOps.get(op)?.category),
+                    directFanIn: m.directFanIn,
+                    transitiveFanIn: m.transitiveFanIn,
+                    directFanOut: m.directFanOut,
+                    primaryPhase: primaryRecipeByOp.get(op)?.phase,
+                };
+            })
+            .sort(
+                (a, b) =>
+                    b.transitiveFanIn - a.transitiveFanIn ||
+                    b.directFanIn - a.directFanIn ||
+                    a.opType.localeCompare(b.opType),
+            )
+            .slice(0, 15);
+
+        // 8. Compute Inter-Level Transition Matrix
+        const transMap = new Map<string, { fromLevel: number; toLevel: number; ops: Set<string>; count: number }>();
+        let totalTransitions = 0;
+        let progressiveTransitions = 0;
+
+        for (const [u, deps] of primaryEdges.entries()) {
+            const fromLevel = levelByOp.get(u)!;
+            if (fromLevel <= 0) continue;
+            for (const v of deps) {
+                const toLevel = levelByOp.get(v)!;
+                if (toLevel < 0 || toLevel >= fromLevel) continue;
+                const key = `${fromLevel}->${toLevel}`;
+                const entry = transMap.get(key) ?? {
+                    fromLevel,
+                    toLevel,
+                    ops: new Set<string>(),
+                    count: 0,
+                };
+                entry.count++;
+                entry.ops.add(u);
+                transMap.set(key, entry);
+
+                totalTransitions++;
+                if (fromLevel - toLevel === 1) progressiveTransitions++;
+            }
+        }
+
+        const transitions: LevelTransitionEdge[] = Array.from(transMap.values())
+            .map((e) => ({
+                fromLevel: e.fromLevel,
+                toLevel: e.toLevel,
+                count: e.count,
+                isProgressive: e.fromLevel - e.toLevel === 1,
+                sampleOps: Array.from(e.ops).sort().slice(0, 5),
+            }))
+            .sort((a, b) => b.fromLevel - a.fromLevel || b.toLevel - a.toLevel);
+
+        const progressiveRatio =
+            totalTransitions > 0 ? progressiveTransitions / totalTransitions : 1;
+
+        return {
+            maxLevel,
+            levels,
+            unresolvedGaps: unresolvedGaps.sort(),
+            convergenceHubs,
+            transitions,
+            progressiveRatio,
+            loopBoundaryLevels: loopBoundaryLevels.sort((a, b) => b - a),
+            sccCycles,
+        };
     }
 }

@@ -168,6 +168,7 @@ export interface OperatorAnalysis {
     readonly maxLoweringDepth: number;
     readonly status: OpCoverageStatus;
     readonly atlasDetail?: PerOperatorAtlasEntry;
+    readonly hierarchyMetrics?: OperatorHierarchyMetrics;
 }
 
 export interface UnimplementedSummary {
@@ -185,4 +186,74 @@ export interface LibraryAnalysisReport {
     readonly prioritizedGaps: OperatorAnalysis[];
     /** Standard ONNX operators from OpRegistry with no recipes and not native */
     readonly unimplementedSummary: UnimplementedSummary;
+    readonly hierarchy: DynamicHierarchyReport;
+}
+
+export interface OperatorHierarchyMetrics {
+    /** Emergent stratum: 0 = native primitive, 1..H = lowering levels, -1 = unhandled gap */
+    readonly level: number;
+    /** Shortest lowering height across all applicable recipes */
+    readonly minLevel: number;
+    /** Longest lowering height across all applicable recipes */
+    readonly maxLevel: number;
+    /** Highest-priority recipe used to determine the primary lowering path */
+    readonly primaryRecipe?: string;
+    readonly sccId: number;
+    /** Number of ops that directly emit this op on their primary lowering path */
+    readonly directFanIn: number;
+    /** Number of higher-level ops that transitively lower through this op */
+    readonly transitiveFanIn: number;
+    /** Number of distinct lower ops emitted by this op's primary recipe */
+    readonly directFanOut: number;
+    /** True if the primary recipe crosses into loop-lowering or exposes control flow */
+    readonly crossesIntoLoop: boolean;
+}
+
+export interface AbstractionLevelSummary {
+    readonly level: number;
+    readonly operators: string[];
+    readonly dominantCategories: { category: string; count: number; ratio: number }[];
+    readonly canonicalizationCount: number;
+    readonly loopLoweringCount: number;
+    readonly controlFlowBoundaryCount: number;
+    readonly approximationCount: number;
+    readonly avgFanIn: number;
+    /** Auto-derived descriptor summarizing the stratum's emergent role */
+    readonly signature: string;
+}
+
+export interface DialectHubEntry {
+    readonly opType: string;
+    readonly level: number;
+    readonly category?: string;
+    readonly directFanIn: number;
+    readonly transitiveFanIn: number;
+    readonly directFanOut: number;
+    readonly primaryPhase?: RecipePhase;
+}
+
+export interface LevelTransitionEdge {
+    readonly fromLevel: number;
+    readonly toLevel: number;
+    readonly count: number;
+    /** True when the edge steps exactly one stratum down (fromLevel - toLevel === 1) */
+    readonly isProgressive: boolean;
+    readonly sampleOps: string[];
+}
+
+export interface DynamicHierarchyReport {
+    readonly maxLevel: number;
+    /** Emergent strata ordered top-down from maxLevel to 0 */
+    readonly levels: AbstractionLevelSummary[];
+    /** Non-native ops with 0 recipes referenced by the library */
+    readonly unresolvedGaps: string[];
+    /** Intermediate ops (0 < level < maxLevel) ranked by cross-level fan-in */
+    readonly convergenceHubs: DialectHubEntry[];
+    readonly transitions: LevelTransitionEdge[];
+    /** Fraction of inter-level edges that step strictly k -> k-1 */
+    readonly progressiveRatio: number;
+    /** Levels where ops cross from tensor-level rewrites into Loop/control-flow lowering */
+    readonly loopBoundaryLevels: number[];
+    /** Non-trivial strongly connected components (size > 1), if any */
+    readonly sccCycles: string[][];
 }

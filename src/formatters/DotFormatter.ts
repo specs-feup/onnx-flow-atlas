@@ -5,10 +5,15 @@ export interface DotExportOptions {
     rootOp?: string;
     /** IncludeLoopLowering recipes in the visual graph */
     includeLoopLowering?: boolean;
+    /** Render a top-down layered graph grouped by emergent abstraction level (L_max -> L0) */
+    groupByLevel?: boolean;
 }
 
 export class DotFormatter {
     public static toDot(report: LibraryAnalysisReport, options: DotExportOptions = {}): string {
+        if (options.groupByLevel) {
+            return this.toHierarchyDot(report);
+        }
         const includeLoops = options.includeLoopLowering ?? true;
         const lines: string[] = [
             "digraph OnnxFlowRecipeAtlas {",
@@ -140,6 +145,99 @@ export class DotFormatter {
                 if (!activeOps.has(prodOp)) continue;
                 lines.push(
                     `  "${recId}" -> "op_${prodOp}" [color="${edgeColor}", style="${edgeStyle}"];`,
+                );
+            }
+        }
+
+        lines.push("}");
+        return lines.join("\n");
+    }
+
+    private static toHierarchyDot(report: LibraryAnalysisReport): string {
+        const h = report.hierarchy;
+        const lines: string[] = [
+            "digraph OnnxFlowAbstractionHierarchy {",
+            "  rankdir=TB;",
+            "  compound=true;",
+            "  splines=true;",
+            "  nodesep=0.25;",
+            "  ranksep=0.75;",
+            '  fontname="Helvetica";',
+            '  node [fontname="Helvetica", fontsize=10];',
+            '  edge [fontname="Helvetica", fontsize=8];',
+            "",
+        ];
+
+        const hubSet = new Set(h.convergenceHubs.slice(0, 8).map((x) => x.opType));
+
+        // 1. Emit one cluster per emergent stratum (top-down: L_max -> L0)
+        for (const stratum of h.levels) {
+            const isLeaf = stratum.level === 0;
+            const clusterFill = isLeaf ? "#f0fff4" : "#f7fafc";
+            const clusterStroke = isLeaf ? "#22543d" : "#4a5568";
+
+            lines.push(`  subgraph cluster_L${stratum.level} {`);
+            lines.push(
+                `    label="Level ${stratum.level} (${stratum.operators.length} ops) — ${stratum.signature}";`,
+            );
+            lines.push(`    style="rounded,filled";`);
+            lines.push(`    fillcolor="${clusterFill}";`);
+            lines.push(`    color="${clusterStroke}";`);
+            lines.push(`    fontsize=11;`);
+
+            for (const opName of stratum.operators) {
+                const info = report.operators.get(opName);
+                const m = info?.hierarchyMetrics;
+                const isHub = hubSet.has(opName);
+                const fill = isLeaf
+                    ? "#c6f6d5"
+                    : isHub
+                      ? "#fefcbf"
+                      : m?.crossesIntoLoop
+                        ? "#feebc8"
+                        : "#ebf8ff";
+                const stroke = isLeaf
+                    ? "#22543d"
+                    : isHub
+                      ? "#975a16"
+                      : m?.crossesIntoLoop
+                        ? "#c05621"
+                        : "#2b6cb0";
+                const penwidth = isHub ? 2.2 : 1.2;
+                const hubTag = isHub ? `\\n[Hub: ${m?.transitiveFanIn}↑]` : "";
+
+                lines.push(
+                    `    "op_${opName}" [label="${opName}${hubTag}", shape=box, style="rounded,filled", fillcolor="${fill}", color="${stroke}", penwidth=${penwidth}];`,
+                );
+            }
+            lines.push("  }", "");
+        }
+
+        // 2. Emit primary-path lowering edges between operators
+        const activeOps = new Set(h.levels.flatMap((s) => s.operators));
+        for (const opName of activeOps) {
+            const info = report.operators.get(opName);
+            const m = info?.hierarchyMetrics;
+            if (!m || m.level <= 0 || !m.primaryRecipe) continue;
+
+            const rec = info?.directRecipes.find((r) => r.name === m.primaryRecipe);
+            if (!rec) continue;
+
+            const probe =
+                rec.dynamicAuditsByOp?.[opName] ??
+                (rec.dynamicAudit?.testedOp === opName ? rec.dynamicAudit : undefined);
+            const produced =
+                probe && probe.succeeded && probe.actualProducedOps.length > 0
+                    ? probe.actualProducedOps
+                    : rec.declaredProducedOps;
+
+            const color = rec.phase === "canonicalization" ? "#2b6cb0" : "#dd6b20";
+            const style = rec.precision === "approximation" ? "dashed" : "solid";
+
+            for (const target of new Set(produced)) {
+                if (target === opName || !activeOps.has(target)) continue;
+                lines.push(
+                    `  "op_${opName}" -> "op_${target}" [color="${color}", style="${style}"];`,
                 );
             }
         }

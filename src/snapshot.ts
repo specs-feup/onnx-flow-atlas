@@ -65,6 +65,16 @@ export async function generateFullSnapshot(outDir: string = "atlas"): Promise<vo
         DotFormatter.toDot(dspReport, { includeLoopLowering: true }),
     );
 
+    console.log(`[Snapshot] Generating emergent abstraction hierarchy maps...`);
+    await renderDotAndSvg(
+        path.join(outDir, "04_cgra_abstraction_hierarchy"),
+        DotFormatter.toDot(cgraReport, { groupByLevel: true }),
+    );
+    await renderDotAndSvg(
+        path.join(outDir, "05_vector_dsp_abstraction_hierarchy"),
+        DotFormatter.toDot(dspReport, { groupByLevel: true }),
+    );
+
     // 4. Generate Per-Operator Lowering Trees & Text Breakdowns for ALL Decomposable Ops
     const decomposableOps = Array.from(cgraReport.operators.values())
         .filter((o) => o.atlasDetail !== undefined)
@@ -106,10 +116,12 @@ export async function generateFullSnapshot(outDir: string = "atlas"): Promise<vo
         `- [**Scalar-CGRA Full Analysis & Gap Report**](./01_cgra_full_report.md) ([Full SVG Map](./01_cgra_full_atlas.svg) | [DOT](./01_cgra_full_atlas.dot))`,
         `- [**Algebraic Canonicalization Map (No Loops)**](./02_canonicalization_only.svg) ([DOT](./02_canonicalization_only.dot))`,
         `- [**Vector-DSP Comparison Report**](./03_vector_dsp_report.md) ([Full SVG Map](./03_vector_dsp_atlas.svg) | [DOT](./03_vector_dsp_atlas.dot))`,
+        `- [**Scalar-CGRA Emergent Abstraction Hierarchy**](./04_cgra_abstraction_hierarchy.svg) ([DOT](./04_cgra_abstraction_hierarchy.dot))`,
+        `- [**Vector-DSP Emergent Abstraction Hierarchy**](./05_vector_dsp_abstraction_hierarchy.svg) ([DOT](./05_vector_dsp_abstraction_hierarchy.dot))`,
         ``,
         `## Per-Operator Lowering Atlas (${decomposableOps.length} Decomposable Operators)`,
-        `| Operator | Status (\`scalar-cgra\`) | Scalar (\`0D\`) Readiness | Shape Support | Best \`0D\` Ratio | Max Depth | Blocking Gaps | Breakdown & Tree |`,
-        `| :--- | :--- | :--- | :---: | :---: | :---: | :--- | :---: |`,
+        `| Operator | Level | Status (\`scalar-cgra\`) | Scalar (\`0D\`) Readiness | Shape Support | Best \`0D\` Ratio | Max Depth | Blocking Gaps | Breakdown & Tree |`,
+        `| :--- | :---: | :--- | :--- | :---: | :---: | :---: | :--- | :---: |`,
     ];
 
     for (const op of decomposableOps) {
@@ -119,8 +131,11 @@ export async function generateFullSnapshot(outDir: string = "atlas"): Promise<vo
         const shapeCol = info.bestShapeSupport ?? "—";
         const gaps = info.blockingLeafGaps.map((g) => `\`${g}\``).join(", ") || "None";
 
+        const lvl = info.hierarchyMetrics?.level;
+        const lvlCell = lvl !== undefined && lvl >= 0 ? `**L${lvl}**` : "Gap";
+        
         indexLines.push(
-            `| \`${op}\` | **${info.status}** | ${detail.scalarReadiness} | ${shapeCol} | **${ratioPct}** | ${info.maxLoweringDepth} | ${gaps} | [Text](./trees/${op}.md) · [SVG](./trees/${op}.svg) · [DOT](./trees/${op}.dot) |`,
+            `| \`${op}\` | ${lvlCell} | **${info.status}** | ${detail.scalarReadiness} | ${shapeCol} | **${ratioPct}** | ${info.maxLoweringDepth} | ${gaps} | [Text](./trees/${op}.md) · [SVG](./trees/${op}.svg) · [DOT](./trees/${op}.dot) |`,
         );
     }
 

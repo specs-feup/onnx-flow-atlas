@@ -35,6 +35,7 @@ export class MarkdownReporter {
             (o) => o.bestShapeSupport === "static",
         ).length;
 
+        // Section 1: Executive Summary
         const lines: string[] = [
             `# ONNX-Flow Decomposition Library Analysis`,
             ``,
@@ -53,6 +54,7 @@ export class MarkdownReporter {
             `| **Decomposable Ops Reaching 100% Scalar (\`0D\`) Compute** | ${fullScalarExact + fullScalarApprox} / ${decomposableOps.length} (${fullScalarExact} exact, ${fullScalarApprox} approx) |`,
             `| **Shape Generality (Decomposable Ops)** | ${dynamicShapeCount} dynamic, ${dynamicBatchCount} dynamic-batch, ${staticOnlyCount} static-only |`,
             `| **Algebraic Rewrite Cycles Detected** | ${report.cycles.length} |`,
+            `| **Emergent Abstraction Levels** | ${report.hierarchy.maxLevel + 1} strata (Level 0..${report.hierarchy.maxLevel}, ${(report.hierarchy.progressiveRatio * 100).toFixed(0)}% progressive transitions) |`,
             ``,
         ];
 
@@ -114,9 +116,73 @@ export class MarkdownReporter {
         }
         lines.push(``);
 
-        // Section 4: Complete Operator Lowering Matrix
+        // Section 4: Emergent Abstraction Hierarchy (Dynamic MLIR-Style Stratification)
+        const h = report.hierarchy;
         lines.push(
-            `## 4. Complete Operator Lowering Matrix`,
+            `## 4. Emergent Abstraction Hierarchy (Dynamic Recipe Stratification)`,
+            `Levels are computed live via bottom-up DAG stratification over primary-path recipe dependencies (\`Level 0\` = native primitives in \`${report.profile.name}\`, up to \`Level ${h.maxLevel}\`). No operator-to-level mapping is hardcoded.`,
+            ``,
+            `- **Emergent Depth:** ${h.maxLevel + 1} levels (\`L${h.maxLevel}\` → \`L0\`)`,
+            `- **Progressive Lowering Ratio (\`Lk → Lk-1\`):** **${(h.progressiveRatio * 100).toFixed(1)}%**`,
+            `- **Loop / Control-Flow Boundary Levels:** ${h.loopBoundaryLevels.map((l) => `\`L${l}\``).join(", ") || "None"}`,
+            `- **Unresolved Sink Gaps (outside ladder):** ${h.unresolvedGaps.map((g) => `\`${g}\``).join(", ") || "None"}`,
+            ``,
+            `### 4.1 Emergent Strata Overview`,
+            `| Level | Ops | Auto-Derived Signature | Canon / Loop | Loop Boundary Ops | Avg Transitive Fan-In | Operators |`,
+            `| :---: | :---: | :--- | :---: | :---: | :---: | :--- |`,
+        );
+
+        for (const stratum of h.levels) {
+            const phaseCell =
+                stratum.level === 0
+                    ? "Native"
+                    : `${stratum.canonicalizationCount} / ${stratum.loopLoweringCount}`;
+            const opPreview =
+                stratum.operators.length <= 12
+                    ? stratum.operators.map((o) => `\`${o}\``).join(", ")
+                    : `${stratum.operators.slice(0, 10).map((o) => `\`${o}\``).join(", ")} *(+${stratum.operators.length - 10} more)*`;
+            lines.push(
+                `| **L${stratum.level}** | ${stratum.operators.length} | ${stratum.signature} | ${phaseCell} | ${stratum.controlFlowBoundaryCount} | ${stratum.avgFanIn.toFixed(1)} | ${opPreview} |`,
+            );
+        }
+        lines.push(``);
+
+        if (h.convergenceHubs.length > 0) {
+            lines.push(
+                `### 4.2 Convergence Hubs (Emergent Intermediate Dialect Ops)`,
+                `Intermediate operators (\`0 < level < L${h.maxLevel}\`) ranked by how many higher-level operators transitively lower through them:`,
+                ``,
+                `| Rank | Operator | Level | Category | Primary Phase | Direct Fan-In | Transitive Fan-In | Fan-Out |`,
+                `| :---: | :--- | :---: | :--- | :---: | :---: | :---: | :---: |`,
+            );
+            h.convergenceHubs.forEach((hub, idx) => {
+                lines.push(
+                    `| **#${idx + 1}** | \`${hub.opType}\` | **L${hub.level}** | ${hub.category ?? "—"} | ${hub.primaryPhase === "canonicalization" ? "Canon" : "Loop"} | ${hub.directFanIn} | **${hub.transitiveFanIn}** | ${hub.directFanOut} |`,
+                );
+            });
+            lines.push(``);
+        }
+
+        if (h.transitions.length > 0) {
+            lines.push(
+                `### 4.3 Inter-Level Transition Matrix`,
+                `| Transition | Style | Edge Count | Sample Source Ops |`,
+                `| :---: | :---: | :---: | :--- |`,
+            );
+            for (const tr of h.transitions) {
+                const style = tr.isProgressive
+                    ? "Progressive (`-1`)"
+                    : `Skip (\`-${tr.fromLevel - tr.toLevel}\`)`;
+                lines.push(
+                    `| \`L${tr.fromLevel} → L${tr.toLevel}\` | ${style} | **${tr.count}** | ${tr.sampleOps.map((o) => `\`${o}\``).join(", ")} |`,
+                );
+            }
+            lines.push(``);
+        }
+
+        // Section 5: Complete Operator Lowering Matrix
+        lines.push(
+            `## 5. Complete Operator Lowering Matrix`,
             `| Operator | Status | Shape Support | Direct Recipes (Phase / Precision / Priority) | Max Depth | Blocking Leaf Gaps (if any) |`,
             `| :--- | :--- | :---: | :--- | :---: | :--- |`,
         );
@@ -142,11 +208,11 @@ export class MarkdownReporter {
         }
         lines.push(``);
 
-        // Section 5: Dynamic Audit Results (if run)
+        // Section 6: Dynamic Audit Results (if run)
         const audited = report.recipes.filter((r) => r.dynamicAudit !== undefined);
         if (audited.length > 0) {
             lines.push(
-                `## 5. Dynamic Synthetic Graph Audit (\`producedOps\` Verification)`,
+                `## 6. Dynamic Synthetic Graph Audit (\`producedOps\` Verification)`,
                 `| Recipe | Phase | Tested Op | Execution | Undeclared Ops (Emitted, missing in \`producedOps\`) | Unobserved Ops (Declared, not emitted) |`,
                 `| :--- | :---: | :--- | :---: | :--- | :--- |`,
             );
@@ -162,9 +228,9 @@ export class MarkdownReporter {
             lines.push(``);
         }
 
-        // Section 6: Per-Operator Decomposition & Reachable Terminal Sets
+        // Section 7: Per-Operator Decomposition & Reachable Terminal Sets
         lines.push(
-            `## 6. Per-Operator Decomposition & Reachable Terminal Sets`,
+            `## 7. Per-Operator Decomposition & Reachable Terminal Sets`,
             `Detailed text breakdown for all **${decomposableOps.length}** operators with at least one decomposition recipe. Rank tags: \`0D\` (Scalar), \`1D\` (Vector), \`2D\` (Matrix), \`ND\` (3D+ Tensor), \`?\` (Static/Unknown). \`(in Loop)\` marks ops emitted inside loop regions; \`~\` marks static lower-bound counts when no dynamic probe succeeded.`,
             ``,
         );
@@ -173,12 +239,12 @@ export class MarkdownReporter {
             lines.push(...this.renderOperatorDetail(op.atlasDetail!));
         }
 
-        // Section 7: Unimplemented Standard ONNX Operators
+        // Section 8: Unimplemented Standard ONNX Operators
         const summary = report.unimplementedSummary;
         if (summary.unimplementedCount > 0) {
             const ratioPercent = ((summary.unimplementedCount / summary.totalStandardOps) * 100).toFixed(1);
             lines.push(
-                `## 7. Unimplemented Standard ONNX Operators`,
+                `## 8. Unimplemented Standard ONNX Operators`,
                 `**${summary.unimplementedCount} out of ${summary.totalStandardOps}** standard ONNX specification operators (**${ratioPercent}%**) currently have **zero decomposition recipes** and are not marked as native primitives in \`${report.profile.name}\`.`,
                 ``,
             );
