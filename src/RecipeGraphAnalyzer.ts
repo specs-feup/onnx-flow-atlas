@@ -525,6 +525,9 @@ export class RecipeGraphAnalyzer {
                         : "full-scalar-exact";
             } else if (best.scalarComputeRatio === 1 && best.blockingGaps.length > 0) {
                 scalarReadiness = "scalar-blocked-non-native";
+            } else if (best.blockingGaps.length === 0) {
+                scalarReadiness =
+                    best.scalarComputeRatio > 0 ? "partial-scalar-native" : "native-vector-ready";
             } else if (best.scalarComputeRatio > 0) {
                 scalarReadiness = "partial-scalar";
             }
@@ -761,9 +764,13 @@ export class RecipeGraphAnalyzer {
                 for (const child of direct.emittedNodes) {
                     const childInLoop = inLoop || child.inLoop;
 
-                    // Rank propagation: canonicalizing a 0D scalar op always produces 0D scalar ops
+                    // Rank propagation: canonicalizing a 0D scalar op preserves 0D only for
+                    // unknown/static-declared child ranks; never clobber concrete non-scalar
+                    // ranks observed by dynamic probes (e.g., loss/reduction ops with 0D output).
                     const effectiveChildRank: TensorRankBucket =
-                        rank === "0D" && rec.phase === "canonicalization"
+                        rank === "0D" &&
+                        rec.phase === "canonicalization" &&
+                        child.rank === "unknown"
                             ? "0D"
                             : child.rank;
 

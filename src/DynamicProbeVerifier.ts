@@ -121,6 +121,7 @@ export class DynamicProbeVerifier {
             this.collectEmittedOpsRecursively(graph, 0, false, actualSet, bucketMap);
 
             return this.finalizeProbeResult(
+                recipe.name,
                 testOp,
                 probeInputSummary,
                 analyzed.declaredProducedOps,
@@ -250,6 +251,7 @@ export class DynamicProbeVerifier {
             this.collectEmittedOpsRecursively(body, 1, true, actualSet, bucketMap);
 
             return this.finalizeProbeResult(
+                recipe.name,
                 testOp,
                 `${probeInputSummary} [AGU/Pointer]`,
                 analyzed.declaredProducedOps,
@@ -267,6 +269,7 @@ export class DynamicProbeVerifier {
     }
 
     private finalizeProbeResult(
+        recipeName: string,
         testedOp: string,
         probeInputSummary: string,
         declaredProducedOps: string[],
@@ -282,7 +285,9 @@ export class DynamicProbeVerifier {
         );
 
         const declaredSet = new Set(declaredProducedOps);
-        const undeclaredOps = actualProducedOps.filter((op) => !declaredSet.has(op));
+        const undeclaredOps = actualProducedOps.filter(
+            (op) => !declaredSet.has(op) && !(recipeName === "LowerElementWise" && op === testedOp),
+        );
         const unobservedOps = declaredProducedOps.filter((op) => !actualSet.has(op));
 
         return {

@@ -25,12 +25,13 @@ export const BUILTIN_PROFILES: Record<string, HardwareProfile> = {
     },
     "vector-dsp": {
         name: "vector-dsp",
-        description: "Vector DSP supporting native reductions, slicing, and basic math",
+        description: "Vector DSP supporting native reductions, slicing, bitwise ALU, and basic math",
         nativePrimitives: new Set([
             "Add", "Sub", "Mul", "Div", "Max", "Min", "Abs", "Neg", "Exp", "Sqrt",
-            "And", "Or", "Not", "Equal", "Greater", "Less", "Where", "Cast",
+            "And", "Or", "Xor", "Not", "Equal", "Greater", "Less", "Where", "Cast",
+            "BitShift", "BitwiseAnd", "BitwiseOr", "BitwiseXor",
             "ReduceSum", "ReduceMax", "ReduceMin", "ReduceProd",
-            "Loop", "Gather", "ScatterElements", "Slice", "Concat", "Pad",
+            "Loop", "If", "Gather", "ScatterElements", "Slice", "Concat", "Pad",
             "Reshape", "Squeeze", "Unsqueeze", "Identity", "Constant", "ConstantOfShape", "Shape", "Size",
         ]),
     },
@@ -139,6 +140,8 @@ export type ScalarReadinessStatus =
     | "full-scalar-exact"
     | "full-scalar-approx"
     | "scalar-blocked-non-native"
+    | "partial-scalar-native"
+    | "native-vector-ready"
     | "partial-scalar"
     | "non-scalar-or-blocked";
 

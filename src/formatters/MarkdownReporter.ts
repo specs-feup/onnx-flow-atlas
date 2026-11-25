@@ -377,6 +377,10 @@ export class MarkdownReporter {
                 return "**100% Scalar (≈Approx)**";
             case "scalar-blocked-non-native":
                 return "0D Scalar (Non-Native Gaps)";
+            case "partial-scalar-native":
+                return "Partial Scalar (Native Vector)";
+            case "native-vector-ready":
+                return "Native Vector (Ready)";
             case "partial-scalar":
                 return "Partial Scalar";
             case "non-scalar-or-blocked":
