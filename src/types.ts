@@ -182,6 +182,18 @@ export interface UnimplementedSummary {
     readonly byCategory: Record<string, string[]>;
 }
 
+export interface FusedLoweringMetrics {
+    readonly opType: string;
+    readonly succeeded: boolean;
+    readonly loopCount: number;
+    readonly scalarComputeCount: number;
+    readonly nonScalarComputeCount: number;
+    readonly indexingScalarCount: number;
+    readonly controlMemoryViewCount: number;
+    readonly totalOps: number;
+    readonly error?: string;
+}
+
 export interface LibraryAnalysisReport {
     readonly profile: HardwareProfile;
     readonly recipes: AnalyzedRecipe[];
@@ -192,6 +204,7 @@ export interface LibraryAnalysisReport {
     /** Standard ONNX operators from OpRegistry with no recipes and not native */
     readonly unimplementedSummary: UnimplementedSummary;
     readonly hierarchy: DynamicHierarchyReport;
+    readonly fusedBenchmarks?: FusedLoweringMetrics[];
 }
 
 export interface OperatorHierarchyMetrics {

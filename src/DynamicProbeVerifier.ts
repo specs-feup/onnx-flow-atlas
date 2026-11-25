@@ -1,6 +1,7 @@
 import * as OnnxFlow from "@specs-feup/onnx-flow";
 import {
     OnnxGraph,
+    OnnxGraphTransformer,
     OperationNode,
     GraphBuilder,
     TensorNode,
@@ -23,6 +24,7 @@ import {
 import type {
     AnalyzedRecipe,
     DynamicProbeResult,
+    FusedLoweringMetrics,
     OpQuantityEntry,
     OpRole,
     TensorRankBucket,
@@ -45,9 +47,94 @@ const REDUCTION_OPS = new Set(["ArgMax", "ArgMin"]);
 
 type GraphNode = ReturnType<OperationNode.Class["outgoers"]["targets"]["toArray"]>[number];
 
+const DEFAULT_FUSED_BENCHMARK_OPS = [
+    "SoftmaxCrossEntropyLoss",
+    "NegativeLogLikelihoodLoss",
+    "LogSoftmax",
+    "Softmax",
+    "LayerNormalization",
+    "BatchNormalization",
+    "GroupNormalization",
+    "InstanceNormalization",
+    "Gelu",
+    "Mish",
+    "Hardmax",
+    "HardSwish",
+    "Det",
+    "GRU",
+    "LSTM",
+];
+
 export class DynamicProbeVerifier {
     public verifyCanonicalizationRecipes(analyzedRecipes: AnalyzedRecipe[]): void {
         this.verifyAllRecipes(analyzedRecipes);
+    }
+
+    public measureFusedBenchmarks(
+        opTypes: string[] = DEFAULT_FUSED_BENCHMARK_OPS,
+    ): FusedLoweringMetrics[] {
+        return opTypes.map((opType) => {
+            try {
+                const { graph } = this.buildSyntheticSingleOpGraph(opType, undefined, 1);
+                const transformed = new OnnxGraphTransformer({
+                    canonicalize: true,
+                    loopLowering: true,
+                    fuse: true,
+                    coalesce: true,
+                    recurse: true,
+                    optimize: true,
+                    decomposeForCgra: false,
+                    indexingMode: IndexingMode.Pointer,
+                }).apply(graph, false);
+
+                const bucketMap = new Map<string, OpQuantityEntry>();
+                const actualSet = new Set<string>();
+                this.collectEmittedOpsRecursively(transformed, 0, true, actualSet, bucketMap);
+
+                let loopCount = 0;
+                let scalarComputeCount = 0;
+                let nonScalarComputeCount = 0;
+                let indexingScalarCount = 0;
+                let controlMemoryViewCount = 0;
+                let totalOps = 0;
+
+                for (const entry of bucketMap.values()) {
+                    totalOps += entry.count;
+                    if (entry.opType === "Loop") loopCount += entry.count;
+                    if (entry.role === "compute") {
+                        if (entry.rank === "0D") scalarComputeCount += entry.count;
+                        else nonScalarComputeCount += entry.count;
+                    } else if (entry.role === "indexing") {
+                        indexingScalarCount += entry.count;
+                    } else {
+                        controlMemoryViewCount += entry.count;
+                    }
+                }
+
+                return {
+                    opType,
+                    succeeded: true,
+                    loopCount,
+                    scalarComputeCount,
+                    nonScalarComputeCount,
+                    indexingScalarCount,
+                    controlMemoryViewCount,
+                    totalOps,
+                };
+            } catch (err) {
+                return {
+                    opType,
+                    succeeded: false,
+                    loopCount: 0,
+                    scalarComputeCount: 0,
+                    nonScalarComputeCount: 0,
+                    indexingScalarCount: 0,
+                    controlMemoryViewCount: 0,
+                    totalOps: 0,
+                    error: err instanceof Error ? err.message : String(err),
+                };
+            }
+        });
     }
 
     public verifyAllRecipes(analyzedRecipes: AnalyzedRecipe[]): void {
@@ -319,7 +406,11 @@ export class DynamicProbeVerifier {
         };
     }
 
-    private buildSyntheticSingleOpGraph(opType: string, recipeName?: string) {
+    private buildSyntheticSingleOpGraph(
+        opType: string,
+        recipeName?: string,
+        rnnSeqLen: number = 3,
+    ) {
         const graph = OnnxGraph.create();
         const builder = new GraphBuilder(graph, "probe");
 
@@ -630,33 +721,33 @@ export class DynamicProbeVerifier {
                 break;
             case "RNN":
                 inputs = [
-                    makeInput("X", DataType.FLOAT, [3, 2, 4]),
+                    makeInput("X", DataType.FLOAT, [rnnSeqLen, 2, 4]),
                     makeInput("W", DataType.FLOAT, [1, 5, 4]),
                     makeInput("R", DataType.FLOAT, [1, 5, 5]),
                 ];
                 attrs = { hidden_size: 5 };
                 outputNames = ["Y", "Y_h"];
-                outShape = [3, 1, 2, 5];
+                outShape = [rnnSeqLen, 1, 2, 5];
                 break;
             case "GRU":
                 inputs = [
-                    makeInput("X", DataType.FLOAT, [3, 2, 4]),
+                    makeInput("X", DataType.FLOAT, [rnnSeqLen, 2, 4]),
                     makeInput("W", DataType.FLOAT, [1, 15, 4]),
                     makeInput("R", DataType.FLOAT, [1, 15, 5]),
                 ];
                 attrs = { hidden_size: 5 };
                 outputNames = ["Y", "Y_h"];
-                outShape = [3, 1, 2, 5];
+                outShape = [rnnSeqLen, 1, 2, 5];
                 break;
             case "LSTM":
                 inputs = [
-                    makeInput("X", DataType.FLOAT, [3, 2, 4]),
+                    makeInput("X", DataType.FLOAT, [rnnSeqLen, 2, 4]),
                     makeInput("W", DataType.FLOAT, [1, 20, 4]),
                     makeInput("R", DataType.FLOAT, [1, 20, 5]),
                 ];
                 attrs = { hidden_size: 5 };
                 outputNames = ["Y", "Y_h", "Y_c"];
-                outShape = [3, 1, 2, 5];
+                outShape = [rnnSeqLen, 1, 2, 5];
                 break;
             case "Scan": {
                 inputs = [

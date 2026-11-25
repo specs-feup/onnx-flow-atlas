@@ -228,6 +228,39 @@ export class MarkdownReporter {
             lines.push(``);
         }
 
+        // Section 6.1: End-to-End Fused Lowering Benchmarks (if run)
+        if (report.fusedBenchmarks && report.fusedBenchmarks.length > 0) {
+            lines.push(
+                `### 6.1 End-to-End Fused Lowering Benchmarks (\`Canonicalization + Fused LoopLowering\`)`,
+                `Measures actual node counts after running the full \`OnnxGraphTransformer\` pipeline (\`fuse: true, coalesce: true, indexingMode: Pointer\`), compared against the unfused compositional upper bound in Section 7.`,
+                ``,
+                `| Operator | Status | Fused \`Loop\`s | Unfused \`Loop\` Bound | Fused \`0D\` Compute | Fused Indexing | Fused Control/Mem/View | Unfused Infra Bound | Total Fused Ops |`,
+                `| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |`,
+            );
+
+            for (const bm of report.fusedBenchmarks) {
+                const opEntry = report.operators.get(bm.opType);
+                const bestSet = opEntry?.atlasDetail?.terminalSets[0];
+                const unfusedLoops = bestSet
+                    ? bestSet.ops
+                          .filter((e) => e.opType === "Loop")
+                          .reduce((s, e) => s + e.count, 0)
+                    : undefined;
+                const unfusedInfra = bestSet?.controlMemoryViewCount;
+
+                if (!bm.succeeded) {
+                    lines.push(
+                        `| \`${bm.opType}\` | FAIL (${bm.error}) | — | ${unfusedLoops ?? "—"} | — | — | — | ${unfusedInfra ?? "—"} | — |`,
+                    );
+                } else {
+                    lines.push(
+                        `| \`${bm.opType}\` | PASS | **${bm.loopCount}** | ${unfusedLoops ?? "—"} | ${bm.scalarComputeCount} | ${bm.indexingScalarCount} | **${bm.controlMemoryViewCount}** | ${unfusedInfra ?? "—"} | ${bm.totalOps} |`,
+                    );
+                }
+            }
+            lines.push(``);
+        }
+
         // Section 7: Per-Operator Decomposition & Reachable Terminal Sets
         lines.push(
             `## 7. Per-Operator Decomposition & Reachable Terminal Sets`,
