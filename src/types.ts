@@ -15,10 +15,12 @@ export const BUILTIN_PROFILES: Record<string, HardwareProfile> = {
             // Arithmetic & Logic
             "Add", "Sub", "Mul", "And", "Or", "Xor", "Not",
             "Equal", "Greater", "Less", "Where", "Cast",
+            // Bitwise Ops
+            "BitShift", "BitwiseAnd", "BitwiseOr", "BitwiseXor",
             // Control Flow & Memory Access
             "Loop", "If", "Gather", "ScatterElements",
             // Zero-cost / Metadata View Ops
-            "Reshape", "Squeeze", "Unsqueeze", "Identity", "Constant", "ConstantOfShape",
+            "Reshape", "Squeeze", "Unsqueeze", "Identity", "Constant", "ConstantOfShape", "Shape", "Size",
         ]),
     },
     "vector-dsp": {

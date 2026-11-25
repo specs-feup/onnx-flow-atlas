@@ -484,24 +484,63 @@ export class DynamicProbeVerifier {
                 ];
                 break;
             case "QuantizeLinear":
-                inputs = [
-                    makeInput("X", DataType.FLOAT, [4, 4]),
-                    builder.createConstant("scale", makeTensorProto(DataType.FLOAT, [], [0.1])),
-                    builder.createConstant("zp", makeTensorProto(DataType.UINT8, [], [0])),
-                ];
-                outDtype = DataType.UINT8;
+                if (recipeName === "LowerQuantizeLinearExtended") {
+                    inputs = [
+                        makeInput("X", DataType.FLOAT, [2, 6]),
+                        builder.createConstant("scale", makeTensorProto(DataType.FLOAT, [2, 3], [0.5, 1, 2, 0.5, 1, 2])),
+                        builder.createConstant("zp", makeTensorProto(DataType.INT8, [2, 3], [0, 0, 0, 0, 0, 0])),
+                    ];
+                    attrs = { axis: 1, block_size: 2 };
+                    outShape = [2, 6];
+                    outDtype = DataType.INT8;
+                } else {
+                    inputs = [
+                        makeInput("X", DataType.FLOAT, [4, 4]),
+                        builder.createConstant("scale", makeTensorProto(DataType.FLOAT, [], [0.1])),
+                        builder.createConstant("zp", makeTensorProto(DataType.UINT8, [], [0])),
+                    ];
+                    outDtype = DataType.UINT8;
+                }
                 break;
             case "DequantizeLinear":
-                inputs = [
-                    makeInput("X", DataType.UINT8, [4, 4]),
-                    builder.createConstant("scale", makeTensorProto(DataType.FLOAT, [], [0.1])),
-                    builder.createConstant("zp", makeTensorProto(DataType.UINT8, [], [0])),
-                ];
+                if (recipeName === "LowerDequantizeLinearBlocked") {
+                    inputs = [
+                        makeInput("X", DataType.INT8, [2, 6]),
+                        builder.createConstant("scale", makeTensorProto(DataType.FLOAT, [2, 3], [0.5, 1, 2, 0.5, 1, 2])),
+                        builder.createConstant("zp", makeTensorProto(DataType.INT8, [2, 3], [0, 0, 0, 0, 0, 0])),
+                    ];
+                    attrs = { axis: 1, block_size: 2 };
+                    outShape = [2, 6];
+                    outDtype = DataType.FLOAT;
+                } else {
+                    inputs = [
+                        makeInput("X", DataType.UINT8, [4, 4]),
+                        builder.createConstant("scale", makeTensorProto(DataType.FLOAT, [], [0.1])),
+                        builder.createConstant("zp", makeTensorProto(DataType.UINT8, [], [0])),
+                    ];
+                }
                 break;
             case "DynamicQuantizeLinear":
                 inputs = [makeInput("X", DataType.FLOAT, [4, 4])];
                 outputNames = ["y", "y_scale", "y_zero_point"];
                 outDtype = DataType.UINT8;
+                break;
+            case "LpNormalization":
+                inputs = [makeInput("X", DataType.FLOAT, [4, 4])];
+                attrs =
+                    recipeName === "LowerLpNormalizationGeneral"
+                        ? { axis: -1, p: 3 }
+                        : { axis: -1, p: 2 };
+                outShape = [4, 4];
+                break;
+            case "Det":
+                if (recipeName === "LowerDetDynamic") {
+                    inputs = [makeInput("X", DataType.FLOAT, [2, 4, 4])];
+                    outShape = [2];
+                } else {
+                    inputs = [makeInput("X", DataType.FLOAT, [4, 4])];
+                    outShape = [];
+                }
                 break;
             case "BatchNormalization":
                 inputs = [

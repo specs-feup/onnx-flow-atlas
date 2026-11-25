@@ -232,10 +232,10 @@ export class RecipeGraphAnalyzer {
         }
         for (const list of directRecipesByOp.values()) {
             list.sort((a, b) => {
+                if (b.priority !== a.priority) return b.priority - a.priority;
                 if (a.phase !== b.phase) {
                     return a.phase === "canonicalization" ? -1 : 1;
                 }
-                if (b.priority !== a.priority) return b.priority - a.priority;
                 return a.name.localeCompare(b.name);
             });
         }
@@ -665,6 +665,36 @@ export class RecipeGraphAnalyzer {
             return `${m.approx ? "A" : "E"}|${parts.join(",")}`;
         };
 
+        const countBlockingGaps = (m: RawMultiset): number => {
+            const gaps = new Set<string>();
+            for (const e of m.entries.values()) {
+                if (!profile.nativePrimitives.has(e.opType)) {
+                    gaps.add(e.opType);
+                }
+            }
+            return gaps.size;
+        };
+
+        const totalOpCount = (m: RawMultiset): number => {
+            let sum = 0;
+            for (const e of m.entries.values()) sum += e.count;
+            return sum;
+        };
+
+        const pruneToBest = (map: Map<string, RawMultiset>): RawMultiset[] => {
+            const all = Array.from(map.values()).sort(
+                (a, b) =>
+                    countBlockingGaps(a) - countBlockingGaps(b) ||
+                    Number(a.approx) - Number(b.approx) ||
+                    totalOpCount(a) - totalOpCount(b),
+            );
+            if (all.length > MAX_TERMINAL_SETS) {
+                truncated = true;
+                return all.slice(0, MAX_TERMINAL_SETS);
+            }
+            return all;
+        };
+
         const expandNode = (
             opType: string,
             rank: TensorRankBucket,
@@ -779,30 +809,22 @@ export class RecipeGraphAnalyzer {
                             };
                             const sig = signatureOf(combined);
                             if (!nextPartials.has(sig)) {
-                                if (nextPartials.size >= MAX_TERMINAL_SETS) {
-                                    truncated = true;
-                                    continue;
-                                }
                                 nextPartials.set(sig, combined);
                             }
                         }
                     }
-                    partials = Array.from(nextPartials.values());
+                    partials = pruneToBest(nextPartials);
                 }
 
                 for (const p of partials) {
                     const sig = signatureOf(p);
                     if (!resultsBySig.has(sig)) {
-                        if (resultsBySig.size >= MAX_TERMINAL_SETS) {
-                            truncated = true;
-                            continue;
-                        }
                         resultsBySig.set(sig, p);
                     }
                 }
             }
 
-            return Array.from(resultsBySig.values());
+            return pruneToBest(resultsBySig);
         };
 
         const rawSets = expandNode(rootOp, "ND", "compute", false, false, new Set(), true);
