@@ -10,6 +10,10 @@ export class MarkdownReporter {
         const ops = Array.from(report.operators.values());
         const nativeCount = ops.filter((o) => o.status === "native-primitive").length;
         const exactCount = ops.filter((o) => o.status === "fully-lowerable-exact").length;
+        const fastPathOnlyExactCount = ops.filter(
+            (o) => o.status === "fully-lowerable-exact" && o.fastPathOnlyExact === true,
+        ).length;
+        const generalExactCount = exactCount - fastPathOnlyExactCount;
         const approxCount = ops.filter((o) => o.status === "fully-lowerable-approx").length;
         const blockedCount = ops.filter((o) => o.status === "partial-or-blocked").length;
         const gapCount = ops.filter((o) => o.status === "unhandled-gap").length;
@@ -47,7 +51,7 @@ export class MarkdownReporter {
             `| **Total Analyzed Operators** | ${ops.length} |`,
             `| **Total Registered Recipes** | ${report.recipes.length} |`,
             `| **Native Target Primitives** | ${nativeCount} |`,
-            `| **Fully Lowerable (Exact)** | ${exactCount} |`,
+            `| **Fully Lowerable (Exact)** | ${exactCount} (${generalExactCount} general, ${fastPathOnlyExactCount} fast-path-only) |`,
             `| **Fully Lowerable (Approximation)** | ${approxCount} |`,
             `| **Partially Lowered (Blocked by Downstream Gaps)** | ${blockedCount} |`,
             `| **Unhandled Gap Operators (No Recipe & Not Native)** | ${gapCount} |`,
@@ -240,30 +244,27 @@ export class MarkdownReporter {
             const passedCount = sortedBenchmarks.filter((b) => b.succeeded).length;
             lines.push(
                 `### 6.1 End-to-End Fused Lowering Benchmarks (\`Canonicalization + Fused LoopLowering\`)`,
-                `Measures actual node counts across **${sortedBenchmarks.length}** decomposable operators (**${passedCount}** succeeded) after running the full \`OnnxGraphTransformer\` pipeline (\`fuse: true, coalesce: true, indexingMode: Pointer\`), compared against the unfused compositional upper bound in Section 7. Sorted descending by fused \`Loop\` count and total fused ops.`,
+                `Measures actual node counts across **${sortedBenchmarks.length}** decomposable operators (**${passedCount}** succeeded) under profile \`${report.profile.name}\` (\`fuse: true, coalesce: true, optimize: true, indexingMode: Pointer, recurse: ${report.profile.name === "scalar-cgra" ? "true" : "false"}\`), compared against actual \`fuse: false\` loop counts. Sorted descending by fused \`Loop\` count and total fused ops.`,
                 ``,
-                `| Operator | Status | Fused \`Loop\`s | Max Depth | Unfused \`Loop\` Bound | Fused \`0D\` Compute | Fused Indexing | Fused Control/Mem/View | Infra / 0D | Barriers | Mode / Schedule Deltas | Total Fused Ops |`,
-                `| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- | :--- | :---: |`,
+                `| Operator | Status | Fused \`Loop\`s | Max Depth | Unfused \`Loop\`s (\`fuse=false\`) | Fused \`0D\` Compute | Fused Indexing | Fused Control/Mem/View | Infra / 0D | Barriers | Non-Native Leaks | Mode / Schedule Deltas | Total Fused Ops |`,
+                `| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- | :--- | :--- | :---: |`,
             );
 
             for (const bm of sortedBenchmarks) {
-                const opEntry = report.operators.get(bm.opType);
-                const bestSet = opEntry?.atlasDetail?.terminalSets[0];
-                const unfusedLoops = bestSet
-                    ? bestSet.ops
-                          .filter((e) => e.opType === "Loop")
-                          .reduce((s, e) => s + e.count, 0)
-                    : undefined;
-                const unfusedInfra = bestSet?.controlMemoryViewCount;
-
                 if (!bm.succeeded) {
                     lines.push(
-                        `| \`${bm.opType}\` | FAIL (${bm.error}) | — | — | ${unfusedLoops ?? "—"} | — | — | — | — | — | — | — |`,
+                        `| \`${bm.opType}\` | FAIL (${bm.error}) | — | — | — | — | — | — | — | — | — | — | — |`,
                     );
                 } else {
+                    const unfusedDisplay =
+                        bm.unfusedLoopCount !== undefined ? `${bm.unfusedLoopCount}` : "—";
                     const barriersStr =
                         bm.fusionBarrierOps.length > 0
                             ? bm.fusionBarrierOps.map((b) => `\`${b}\``).join(", ")
+                            : "None";
+                    const leaksStr =
+                        bm.unloweredNonNativeOps.length > 0
+                            ? bm.unloweredNonNativeOps.map((o) => `\`${o}\``).join(", ")
                             : "None";
                     const variantsStr =
                         bm.variants && bm.variants.length > 0
@@ -278,7 +279,7 @@ export class MarkdownReporter {
                                   .join("<br>")
                             : "—";
                     lines.push(
-                        `| \`${bm.opType}\` | PASS | **${bm.loopCount}** | ${bm.maxLoopDepth} | ${unfusedLoops ?? "—"} | ${bm.scalarComputeCount} | ${bm.indexingScalarCount} | **${bm.controlMemoryViewCount}** | ${bm.infraPerComputeRatio.toFixed(2)} | ${barriersStr} | ${variantsStr} | ${bm.totalOps} |`,
+                        `| \`${bm.opType}\` | PASS | **${bm.loopCount}** | ${bm.maxLoopDepth} | ${unfusedDisplay} | ${bm.scalarComputeCount} | ${bm.indexingScalarCount} | **${bm.controlMemoryViewCount}** | ${bm.infraPerComputeRatio.toFixed(2)} | ${barriersStr} | ${leaksStr} | ${variantsStr} | ${bm.totalOps} |`,
                     );
                 }
             }
@@ -342,6 +343,43 @@ export class MarkdownReporter {
                 });
                 lines.push(``);
             }
+        }
+
+        // Section 6.2.1: Multi-Op, Dynamic & Edge-Case Scenario Probes
+        if (report.scenarioBenchmarks && report.scenarioBenchmarks.length > 0) {
+            lines.push(
+                `### 6.2.1 Representative Multi-Op, Dynamic & Edge-Case Scenario Probes`,
+                `Tests realistic dynamic shapes, fallback branches, and multi-consumer fork patterns missed by isolated single-op static fixtures.`,
+                ``,
+                `| Scenario | Status | Fused \`Loop\`s | Unfused \`Loop\`s | \`0D\` Compute | Infra Ops | Non-Native Leaks | Mode / Schedule Deltas | Total Ops |`,
+                `| :--- | :---: | :---: | :---: | :---: | :---: | :--- | :--- | :---: |`,
+            );
+            for (const bm of report.scenarioBenchmarks) {
+                if (!bm.succeeded) {
+                    lines.push(`| \`${bm.opType}\` | FAIL (${bm.error}) | — | — | — | — | — | — | — |`);
+                } else {
+                    const leaksStr =
+                        bm.unloweredNonNativeOps.length > 0
+                            ? bm.unloweredNonNativeOps.map((o) => `\`${o}\``).join(", ")
+                            : "None";
+                    const variantsStr =
+                        bm.variants && bm.variants.length > 0
+                            ? bm.variants
+                                  .map((v) => {
+                                      const dl = v.loopCount - bm.loopCount;
+                                      const dt = v.totalOps - bm.totalOps;
+                                      const dlStr = dl === 0 ? "0" : dl > 0 ? `+${dl}` : `${dl}`;
+                                      const dtStr = dt === 0 ? "0" : dt > 0 ? `+${dt}` : `${dt}`;
+                                      return `\`${v.label}\`: ${v.loopCount}L (${dlStr}), ${v.totalOps} ops (${dtStr})`;
+                                  })
+                                  .join("<br>")
+                            : "—";
+                    lines.push(
+                        `| \`${bm.opType}\` | PASS | **${bm.loopCount}** | ${bm.unfusedLoopCount ?? "—"} | ${bm.scalarComputeCount} | ${bm.indexingScalarCount + bm.controlMemoryViewCount} | ${leaksStr} | ${variantsStr} | ${bm.totalOps} |`,
+                    );
+                }
+            }
+            lines.push(``);
         }
 
         // Section 6.3: Approximation Root-Cause Roadmap

@@ -33,10 +33,16 @@ export async function generateFullSnapshot(outDir: string = "atlas"): Promise<vo
         .filter((o) => o.atlasDetail !== undefined && !o.isNativePrimitive)
         .map((o) => o.opType)
         .sort();
-    const fusedBenchmarks = verifier.measureFusedBenchmarks(allBenchmarkOps);
+    const fusedBenchmarks = verifier.measureFusedBenchmarks(allBenchmarkOps, cgraProfile, {
+        strictScalarRecurse: true,
+    });
+    const scenarioBenchmarks = verifier.measureScenarioBenchmarks(cgraProfile, {
+        strictScalarRecurse: true,
+    });
     const cgraReport = {
         ...baseCgraReport,
         fusedBenchmarks,
+        scenarioBenchmarks,
     };
 
     fs.writeFileSync(
@@ -60,7 +66,20 @@ export async function generateFullSnapshot(outDir: string = "atlas"): Promise<vo
     // 3. Analyze Vector-DSP Profile (Comparison)
     console.log(`[Snapshot] Generating Vector-DSP comparison report & map...`);
     const dspProfile = BUILTIN_PROFILES["vector-dsp"];
-    const dspReport = analyzer.analyze(dspProfile, recipes);
+    const baseDspReport = analyzer.analyze(dspProfile, recipes);
+    const dspBenchmarkOps = Array.from(baseDspReport.operators.values())
+        .filter((o) => o.atlasDetail !== undefined && !o.isNativePrimitive)
+        .map((o) => o.opType)
+        .sort();
+    const dspReport = {
+        ...baseDspReport,
+        fusedBenchmarks: verifier.measureFusedBenchmarks(dspBenchmarkOps, dspProfile, {
+            strictScalarRecurse: false,
+        }),
+        scenarioBenchmarks: verifier.measureScenarioBenchmarks(dspProfile, {
+            strictScalarRecurse: false,
+        }),
+    };
 
     fs.writeFileSync(
         path.join(outDir, "03_vector_dsp_report.md"),

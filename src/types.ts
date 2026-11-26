@@ -172,6 +172,8 @@ export interface OperatorAnalysis {
     readonly requiresApproximation: boolean;
     readonly maxLoweringDepth: number;
     readonly status: OpCoverageStatus;
+    /** True if the op only reaches Exact via a conditional fast-path recipe while general fallback is Approx */
+    readonly fastPathOnlyExact?: boolean;
     readonly atlasDetail?: PerOperatorAtlasEntry;
     readonly hierarchyMetrics?: OperatorHierarchyMetrics;
 }
@@ -194,12 +196,18 @@ export interface FusedLoweringMetrics {
     readonly succeeded: boolean;
     readonly loopCount: number;
     readonly maxLoopDepth: number;
+    /** Actual loop count measured with fuse: false (apples-to-apples fusion baseline) */
+    readonly unfusedLoopCount?: number;
+    /** Actual total ops measured with fuse: false */
+    readonly unfusedTotalOps?: number;
     readonly scalarComputeCount: number;
     readonly nonScalarComputeCount: number;
     readonly indexingScalarCount: number;
     readonly controlMemoryViewCount: number;
     readonly infraPerComputeRatio: number;
     readonly fusionBarrierOps: string[];
+    /** Ops emitted anywhere (including inside Loop bodies) missing from profile.nativePrimitives */
+    readonly unloweredNonNativeOps: string[];
     readonly variants?: FusedModeVariant[];
     readonly totalOps: number;
     readonly error?: string;
@@ -232,6 +240,7 @@ export interface LibraryAnalysisReport {
     readonly hierarchy: DynamicHierarchyReport;
     readonly approximationHotspots?: ApproximationRootEntry[];
     readonly fusedBenchmarks?: FusedLoweringMetrics[];
+    readonly scenarioBenchmarks?: FusedLoweringMetrics[];
 }
 
 export interface OperatorHierarchyMetrics {

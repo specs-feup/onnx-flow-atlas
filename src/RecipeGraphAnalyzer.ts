@@ -33,6 +33,14 @@ import type {
 } from "./types.js";
 
 const OPSET_VERSION = 19;
+
+const CONDITIONAL_FASTPATH_TAGS = new Set([
+    "exact-power-of-two",
+    "constant-divisor",
+    "small-int",
+    "conv-1x1",
+    "noop",
+]);
 const MAX_TERMINAL_SETS = 12;
 
 const CONTROL_OPS = new Set(["Loop", "If", "Scan"]);
@@ -391,10 +399,27 @@ export class RecipeGraphAnalyzer {
                     }
                 }
 
+                const isConditionalRecipe = (recName: string): boolean => {
+                    const rec = recipes.find((r) => r.name === recName);
+                    return rec?.tags.some((t) => CONDITIONAL_FASTPATH_TAGS.has(t)) ?? false;
+                };
+
+                const generalExactSet = atlasDetail.terminalSets.find(
+                    (s) =>
+                        s.reachesFullScalar &&
+                        s.precision === "exact" &&
+                        !s.recipeChain.some((rn) => isConditionalRecipe(rn)),
+                );
+                const fastPathOnlyExact =
+                    status === "fully-lowerable-exact" &&
+                    generalExactSet === undefined &&
+                    atlasDetail.terminalSets.some((s) => s.reachesFullScalar);
+
                 operators.set(op, {
                     ...analysis,
                     bestShapeSupport,
                     status,
+                    fastPathOnlyExact,
                     blockingLeafGaps,
                     requiresApproximation,
                     atlasDetail,
@@ -451,9 +476,21 @@ export class RecipeGraphAnalyzer {
             }
         >();
 
+        const isConditionalRecipe = (recName: string): boolean => {
+            const rec = recipeByName.get(recName);
+            return rec?.tags.some((t) => CONDITIONAL_FASTPATH_TAGS.has(t)) ?? false;
+        };
+
         for (const op of operators.values()) {
-            if (op.status !== "fully-lowerable-approx" || !op.atlasDetail) continue;
+            if (!op.atlasDetail) continue;
+            if (op.status !== "fully-lowerable-approx" && !op.fastPathOnlyExact) continue;
+            // Trace general-input fallback path (ignoring conditional constant fast-paths like exact power-of-2 Div)
             const fullSet =
+                op.atlasDetail.terminalSets.find(
+                    (s) =>
+                        s.reachesFullScalar &&
+                        !s.recipeChain.some((rn) => isConditionalRecipe(rn)),
+                ) ??
                 op.atlasDetail.terminalSets.find((s) => s.reachesFullScalar) ??
                 op.atlasDetail.terminalSets[0];
             if (!fullSet) continue;

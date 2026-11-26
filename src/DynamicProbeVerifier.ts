@@ -27,6 +27,7 @@ import type {
     DynamicProbeResult,
     FusedLoweringMetrics,
     FusedModeVariant,
+    HardwareProfile,
     OpQuantityEntry,
     OpRole,
     TensorRankBucket,
@@ -72,9 +73,11 @@ export class DynamicProbeVerifier {
         this.verifyAllRecipes(analyzedRecipes);
     }
 
-    public measureFusedBenchmarks(
-        opTypes: string[] = DEFAULT_FUSED_BENCHMARK_OPS,
-    ): FusedLoweringMetrics[] {
+    private measureGraphPipeline(
+        buildGraph: () => OnnxGraph.Class,
+        profile?: HardwareProfile,
+        extraOpts: Record<string, unknown> = {},
+    ) {
         const computeMaxLoopDepth = (g: OnnxGraph.Class, depth: number = 0): number => {
             let maxD = depth;
             for (const op of g.getOperationNodes()) {
@@ -86,98 +89,122 @@ export class DynamicProbeVerifier {
             return maxD;
         };
 
-        const collectPipelineCounts = (
-            opType: string,
-            extraOpts: Record<string, unknown> = {},
-        ) => {
-            const { graph } = this.buildSyntheticSingleOpGraph(opType, undefined, 1);
-            const transformed = new OnnxGraphTransformer({
-                canonicalize: true,
-                loopLowering: true,
-                fuse: true,
-                coalesce: true,
-                recurse: true,
-                optimize: true,
-                decomposeForCgra: false,
-                indexingMode: IndexingMode.Pointer,
-                ...extraOpts,
-            }).apply(graph, false);
+        const graph = buildGraph();
+        const transformed = new OnnxGraphTransformer({
+            canonicalize: true,
+            loopLowering: true,
+            fuse: true,
+            coalesce: true,
+            recurse: true,
+            optimize: true,
+            decomposeForCgra: false,
+            indexingMode: IndexingMode.Pointer,
+            ...extraOpts,
+        }).apply(graph, false);
 
-            const bucketMap = new Map<string, OpQuantityEntry>();
-            const actualSet = new Set<string>();
-            this.collectEmittedOpsRecursively(transformed, 0, true, actualSet, bucketMap);
+        const bucketMap = new Map<string, OpQuantityEntry>();
+        const actualSet = new Set<string>();
+        this.collectEmittedOpsRecursively(transformed, 0, true, actualSet, bucketMap);
 
-            let loopCount = 0;
-            let scalarComputeCount = 0;
-            let nonScalarComputeCount = 0;
-            let indexingScalarCount = 0;
-            let controlMemoryViewCount = 0;
-            let totalOps = 0;
+        let loopCount = 0;
+        let scalarComputeCount = 0;
+        let nonScalarComputeCount = 0;
+        let indexingScalarCount = 0;
+        let controlMemoryViewCount = 0;
+        let totalOps = 0;
 
-            for (const entry of bucketMap.values()) {
-                totalOps += entry.count;
-                if (entry.opType === "Loop") loopCount += entry.count;
-                if (entry.role === "compute") {
-                    if (entry.rank === "0D") scalarComputeCount += entry.count;
-                    else nonScalarComputeCount += entry.count;
-                } else if (entry.role === "indexing") {
-                    indexingScalarCount += entry.count;
-                } else {
-                    controlMemoryViewCount += entry.count;
-                }
+        for (const entry of bucketMap.values()) {
+            totalOps += entry.count;
+            if (entry.opType === "Loop") loopCount += entry.count;
+            if (entry.role === "compute") {
+                if (entry.rank === "0D") scalarComputeCount += entry.count;
+                else nonScalarComputeCount += entry.count;
+            } else if (entry.role === "indexing") {
+                indexingScalarCount += entry.count;
+            } else {
+                controlMemoryViewCount += entry.count;
             }
+        }
 
-            const barrierSet = new Set<string>();
-            for (const topOp of transformed.getOperationNodes()) {
-                if (topOp.type === "Loop") {
-                    const srcTypes = topOp.getMetadata("sourceOpTypes");
-                    if (Array.isArray(srcTypes)) {
-                        for (const t of srcTypes) {
-                            const s = String(t);
-                            if (
-                                s === "MatMul" ||
-                                s === "Conv" ||
-                                s === "MaxPool" ||
-                                s === "AveragePool" ||
-                                s === "Slice" ||
-                                s === "Concat" ||
-                                s === "Pad" ||
-                                s === "TopK" ||
-                                s === "ArgMax" ||
-                                s === "ArgMin" ||
-                                s === "Softmax" ||
-                                s === "LayerNormalization" ||
-                                s.startsWith("Reduce")
-                            ) {
-                                barrierSet.add(s);
-                            }
+        const barrierSet = new Set<string>();
+        for (const topOp of transformed.getOperationNodes()) {
+            if (topOp.type === "Loop") {
+                const srcTypes = topOp.getMetadata("sourceOpTypes");
+                if (Array.isArray(srcTypes)) {
+                    for (const t of srcTypes) {
+                        const s = String(t);
+                        if (
+                            s === "MatMul" ||
+                            s === "Conv" ||
+                            s === "MaxPool" ||
+                            s === "AveragePool" ||
+                            s === "Slice" ||
+                            s === "Concat" ||
+                            s === "Pad" ||
+                            s === "TopK" ||
+                            s === "ArgMax" ||
+                            s === "ArgMin" ||
+                            s === "Softmax" ||
+                            s === "LayerNormalization" ||
+                            s.startsWith("Reduce")
+                        ) {
+                            barrierSet.add(s);
                         }
                     }
                 }
             }
+        }
 
-            return {
-                loopCount,
-                maxLoopDepth: computeMaxLoopDepth(transformed, 0),
-                scalarComputeCount,
-                nonScalarComputeCount,
-                indexingScalarCount,
-                controlMemoryViewCount,
-                infraPerComputeRatio:
-                    (indexingScalarCount + controlMemoryViewCount) /
-                    Math.max(1, scalarComputeCount),
-                fusionBarrierOps: Array.from(barrierSet).sort(),
-                totalOps,
-            };
+        const unloweredNonNativeOps = profile
+            ? Array.from(actualSet)
+                  .filter((t) => !profile.nativePrimitives.has(t))
+                  .sort()
+            : [];
+
+        return {
+            loopCount,
+            maxLoopDepth: computeMaxLoopDepth(transformed, 0),
+            scalarComputeCount,
+            nonScalarComputeCount,
+            indexingScalarCount,
+            controlMemoryViewCount,
+            infraPerComputeRatio:
+                (indexingScalarCount + controlMemoryViewCount) / Math.max(1, scalarComputeCount),
+            fusionBarrierOps: Array.from(barrierSet).sort(),
+            unloweredNonNativeOps,
+            totalOps,
         };
+    }
+
+    public measureFusedBenchmarks(
+        opTypes: string[] = DEFAULT_FUSED_BENCHMARK_OPS,
+        profile?: HardwareProfile,
+        options: { strictScalarRecurse?: boolean } = {},
+    ): FusedLoweringMetrics[] {
+        const defaultRecurse = options.strictScalarRecurse ?? profile?.name === "scalar-cgra";
 
         return opTypes.map((opType) => {
             try {
-                const base = collectPipelineCounts(opType);
+                const build = () => this.buildSyntheticSingleOpGraph(opType, undefined, 1).graph;
+                const base = this.measureGraphPipeline(build, profile, {
+                    recurse: defaultRecurse,
+                });
                 const variants: FusedModeVariant[] = [];
 
+                let unfusedLoopCount: number | undefined;
+                let unfusedTotalOps: number | undefined;
                 if (base.loopCount > 0) {
-                    const scanRes = collectPipelineCounts(opType, { useScanOutputs: true });
+                    const unfusedRes = this.measureGraphPipeline(build, profile, {
+                        fuse: false,
+                        recurse: defaultRecurse,
+                    });
+                    unfusedLoopCount = unfusedRes.loopCount;
+                    unfusedTotalOps = unfusedRes.totalOps;
+
+                    const scanRes = this.measureGraphPipeline(build, profile, {
+                        useScanOutputs: true,
+                        recurse: defaultRecurse,
+                    });
                     variants.push({
                         label: "scan_outputs",
                         loopCount: scanRes.loopCount,
@@ -186,7 +213,39 @@ export class DynamicProbeVerifier {
                     });
                 }
 
-                if (opType === "Softmax" || opType === "LayerNormalization" || opType === "LogSoftmax" || opType === "RMSNormalization") {
+                if (defaultRecurse) {
+                    const nonRec = this.measureGraphPipeline(build, profile, { recurse: false });
+                    if (nonRec.totalOps !== base.totalOps) {
+                        variants.push({
+                            label: "no_recurse",
+                            loopCount: nonRec.loopCount,
+                            controlMemoryViewCount: nonRec.controlMemoryViewCount,
+                            totalOps: nonRec.totalOps,
+                        });
+                    }
+                }
+
+                if (base.loopCount > 1) {
+                    const multiRes = this.measureGraphPipeline(build, profile, {
+                        fuseMultiOutput: true,
+                        recurse: defaultRecurse,
+                    });
+                    if (multiRes.loopCount !== base.loopCount || multiRes.totalOps !== base.totalOps) {
+                        variants.push({
+                            label: "fuse_multi",
+                            loopCount: multiRes.loopCount,
+                            controlMemoryViewCount: multiRes.controlMemoryViewCount,
+                            totalOps: multiRes.totalOps,
+                        });
+                    }
+                }
+
+                if (
+                    opType === "Softmax" ||
+                    opType === "LayerNormalization" ||
+                    opType === "LogSoftmax" ||
+                    opType === "RMSNormalization"
+                ) {
                     const loopRecipeName =
                         opType === "Softmax"
                             ? "LowerSoftmaxLoop"
@@ -195,7 +254,8 @@ export class DynamicProbeVerifier {
                               : opType === "RMSNormalization"
                                 ? "LowerRMSNormLoop"
                                 : "LowerLayerNormLoop";
-                    const schedRes = collectPipelineCounts(opType, {
+                    const schedRes = this.measureGraphPipeline(build, profile, {
+                        recurse: defaultRecurse,
                         schedule: new Schedule().useRecipe(opType, loopRecipeName),
                     });
                     variants.push({
@@ -210,6 +270,8 @@ export class DynamicProbeVerifier {
                     opType,
                     succeeded: true,
                     ...base,
+                    ...(unfusedLoopCount !== undefined ? { unfusedLoopCount } : {}),
+                    ...(unfusedTotalOps !== undefined ? { unfusedTotalOps } : {}),
                     variants,
                 };
             } catch (err) {
@@ -224,6 +286,200 @@ export class DynamicProbeVerifier {
                     controlMemoryViewCount: 0,
                     infraPerComputeRatio: 0,
                     fusionBarrierOps: [],
+                    unloweredNonNativeOps: [],
+                    totalOps: 0,
+                    error: err instanceof Error ? err.message : String(err),
+                };
+            }
+        });
+    }
+
+    /**
+     * Benchmarks representative dynamic-shape, edge-case fallback, and multi-op fork subgraphs
+     * that single-op static fixtures cannot capture.
+     */
+    public measureScenarioBenchmarks(
+        profile?: HardwareProfile,
+        options: { strictScalarRecurse?: boolean } = {},
+    ): FusedLoweringMetrics[] {
+        const defaultRecurse = options.strictScalarRecurse ?? profile?.name === "scalar-cgra";
+
+        const scenarios: Array<{
+            name: string;
+            build: () => OnnxGraph.Class;
+            testPreset?: boolean;
+        }> = [
+            {
+                name: "Scenario:Det_dynamic_[-1,-1,-1]",
+                build: () => {
+                    const g = OnnxGraph.create();
+                    const b = new GraphBuilder(g, "sc_det_dyn");
+                    const x = b.createTensor("X", DataType.FLOAT, [-1, -1, -1], "input");
+                    const [out] = b.createOp("Det", [x], {}, [{ type: DataType.FLOAT, shape: [-1] }]);
+                    if (out.is(TensorNode)) out.as(TensorNode).setType("output");
+                    return g;
+                },
+            },
+            {
+                name: "Scenario:Softmax_dynamic_[-1,16]",
+                build: () => {
+                    const g = OnnxGraph.create();
+                    const b = new GraphBuilder(g, "sc_sm_dyn");
+                    const x = b.createTensor("X", DataType.FLOAT, [-1, 16], "input");
+                    const [out] = b.createOp("Softmax", [x], { axis: -1 }, [
+                        { type: DataType.FLOAT, shape: [-1, 16] },
+                    ]);
+                    if (out.is(TensorNode)) out.as(TensorNode).setType("output");
+                    return g;
+                },
+                testPreset: true,
+            },
+            {
+                name: "Scenario:AveragePool_padded_excl",
+                build: () => {
+                    const g = OnnxGraph.create();
+                    const b = new GraphBuilder(g, "sc_ap_pad");
+                    const x = b.createTensor("X", DataType.FLOAT, [1, 2, 8, 8], "input");
+                    const [out] = b.createOp(
+                        "AveragePool",
+                        [x],
+                        { kernel_shape: [3, 3], strides: [1, 1], pads: [1, 1, 1, 1], count_include_pad: 0 },
+                        [{ type: DataType.FLOAT, shape: [1, 2, 8, 8] }],
+                    );
+                    if (out.is(TensorNode)) out.as(TensorNode).setType("output");
+                    return g;
+                },
+            },
+            {
+                name: "Scenario:Conv_1x1_pointwise",
+                build: () => {
+                    const g = OnnxGraph.create();
+                    const b = new GraphBuilder(g, "sc_c1x1");
+                    const x = b.createTensor("X", DataType.FLOAT, [1, 4, 8, 8], "input");
+                    const w = b.createTensor("W", DataType.FLOAT, [8, 4, 1, 1], "input");
+                    const [out] = b.createOp(
+                        "Conv",
+                        [x, w],
+                        { kernel_shape: [1, 1], strides: [1, 1], pads: [0, 0, 0, 0] },
+                        [{ type: DataType.FLOAT, shape: [1, 8, 8, 8] }],
+                    );
+                    if (out.is(TensorNode)) out.as(TensorNode).setType("output");
+                    return g;
+                },
+            },
+            {
+                name: "Scenario:Residual_Skip_Fork",
+                build: () => {
+                    const g = OnnxGraph.create();
+                    const b = new GraphBuilder(g, "sc_res");
+                    const x = b.createTensor("X", DataType.FLOAT, [1, 4, 4], "input");
+                    const [r1] = b.createOp("Relu", [x], {}, [{ type: DataType.FLOAT, shape: [1, 4, 4] }]);
+                    const [s1] = b.createOp("Sigmoid", [r1], {}, [{ type: DataType.FLOAT, shape: [1, 4, 4] }]);
+                    const [n1] = b.createOp("Neg", [r1], {}, [{ type: DataType.FLOAT, shape: [1, 4, 4] }]);
+                    const [addOut] = b.createOp("Add", [s1, n1], {}, [
+                        { type: DataType.FLOAT, shape: [1, 4, 4] },
+                    ]);
+                    if (addOut.is(TensorNode)) addOut.as(TensorNode).setType("output");
+                    return g;
+                },
+            },
+            {
+                name: "Scenario:RMSNorm_Attention_Swish",
+                build: () => {
+                    const g = OnnxGraph.create();
+                    const b = new GraphBuilder(g, "sc_llm");
+                    const x = b.createTensor("X", DataType.FLOAT, [1, 2, 4, 4], "input");
+                    const sc = b.createConstant("Scale", makeTensorProto(DataType.FLOAT, [4], [1, 1, 1, 1]));
+                    const [rn] = b.createOp("RMSNormalization", [x, sc], { axis: -1, epsilon: 1e-5 }, [
+                        { type: DataType.FLOAT, shape: [1, 2, 4, 4] },
+                    ]);
+                    const [att] = b.createOp(
+                        "Attention",
+                        [rn, rn, rn],
+                        { q_num_heads: 2, kv_num_heads: 2 },
+                        [{ type: DataType.FLOAT, shape: [1, 2, 4, 4] }],
+                    );
+                    const [sw] = b.createOp("Swish", [att], {}, [
+                        { type: DataType.FLOAT, shape: [1, 2, 4, 4] },
+                    ]);
+                    if (sw.is(TensorNode)) sw.as(TensorNode).setType("output");
+                    return g;
+                },
+                testPreset: true,
+            },
+        ];
+
+        return scenarios.map((sc) => {
+            try {
+                const base = this.measureGraphPipeline(sc.build, profile, {
+                    recurse: defaultRecurse,
+                });
+                const variants: FusedModeVariant[] = [];
+
+                const unfused = this.measureGraphPipeline(sc.build, profile, {
+                    fuse: false,
+                    recurse: defaultRecurse,
+                });
+                if (base.loopCount > 0) {
+                    const scanRes = this.measureGraphPipeline(sc.build, profile, {
+                        useScanOutputs: true,
+                        recurse: defaultRecurse,
+                    });
+                    variants.push({
+                        label: "scan_outputs",
+                        loopCount: scanRes.loopCount,
+                        controlMemoryViewCount: scanRes.controlMemoryViewCount,
+                        totalOps: scanRes.totalOps,
+                    });
+                }
+                if (base.loopCount > 1) {
+                    const multi = this.measureGraphPipeline(sc.build, profile, {
+                        fuseMultiOutput: true,
+                        recurse: defaultRecurse,
+                    });
+                    if (multi.loopCount !== base.loopCount || multi.totalOps !== base.totalOps) {
+                        variants.push({
+                            label: "fuse_multi",
+                            loopCount: multi.loopCount,
+                            controlMemoryViewCount: multi.controlMemoryViewCount,
+                            totalOps: multi.totalOps,
+                        });
+                    }
+                }
+                if (sc.testPreset) {
+                    const sfuRes = this.measureGraphPipeline(sc.build, profile, {
+                        recurse: defaultRecurse,
+                        schedule: Schedule.preset("sfu-loops"),
+                    });
+                    variants.push({
+                        label: "preset:sfu-loops",
+                        loopCount: sfuRes.loopCount,
+                        controlMemoryViewCount: sfuRes.controlMemoryViewCount,
+                        totalOps: sfuRes.totalOps,
+                    });
+                }
+
+                return {
+                    opType: sc.name,
+                    succeeded: true,
+                    ...base,
+                    unfusedLoopCount: unfused.loopCount,
+                    unfusedTotalOps: unfused.totalOps,
+                    variants,
+                };
+            } catch (err) {
+                return {
+                    opType: sc.name,
+                    succeeded: false,
+                    loopCount: 0,
+                    maxLoopDepth: 0,
+                    scalarComputeCount: 0,
+                    nonScalarComputeCount: 0,
+                    indexingScalarCount: 0,
+                    controlMemoryViewCount: 0,
+                    infraPerComputeRatio: 0,
+                    fusionBarrierOps: [],
+                    unloweredNonNativeOps: [],
                     totalOps: 0,
                     error: err instanceof Error ? err.message : String(err),
                 };
