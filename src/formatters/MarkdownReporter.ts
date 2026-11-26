@@ -228,17 +228,25 @@ export class MarkdownReporter {
             lines.push(``);
         }
 
-        // Section 6.1: End-to-End Fused Lowering Benchmarks (if run)
+        // Section 6.1 & 6.2: End-to-End Fused Lowering Benchmarks & Hotspots (if run)
         if (report.fusedBenchmarks && report.fusedBenchmarks.length > 0) {
+            const sortedBenchmarks = [...report.fusedBenchmarks].sort((a, b) => {
+                if (a.succeeded !== b.succeeded) return a.succeeded ? 1 : -1;
+                if (b.loopCount !== a.loopCount) return b.loopCount - a.loopCount;
+                if (b.totalOps !== a.totalOps) return b.totalOps - a.totalOps;
+                return a.opType.localeCompare(b.opType);
+            });
+
+            const passedCount = sortedBenchmarks.filter((b) => b.succeeded).length;
             lines.push(
                 `### 6.1 End-to-End Fused Lowering Benchmarks (\`Canonicalization + Fused LoopLowering\`)`,
-                `Measures actual node counts after running the full \`OnnxGraphTransformer\` pipeline (\`fuse: true, coalesce: true, indexingMode: Pointer\`), compared against the unfused compositional upper bound in Section 7.`,
+                `Measures actual node counts across **${sortedBenchmarks.length}** decomposable operators (**${passedCount}** succeeded) after running the full \`OnnxGraphTransformer\` pipeline (\`fuse: true, coalesce: true, indexingMode: Pointer\`), compared against the unfused compositional upper bound in Section 7. Sorted descending by fused \`Loop\` count and total fused ops.`,
                 ``,
-                `| Operator | Status | Fused \`Loop\`s | Unfused \`Loop\` Bound | Fused \`0D\` Compute | Fused Indexing | Fused Control/Mem/View | Unfused Infra Bound | Total Fused Ops |`,
-                `| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |`,
+                `| Operator | Status | Fused \`Loop\`s | Max Depth | Unfused \`Loop\` Bound | Fused \`0D\` Compute | Fused Indexing | Fused Control/Mem/View | Infra / 0D | Barriers | Mode / Schedule Deltas | Total Fused Ops |`,
+                `| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- | :--- | :---: |`,
             );
 
-            for (const bm of report.fusedBenchmarks) {
+            for (const bm of sortedBenchmarks) {
                 const opEntry = report.operators.get(bm.opType);
                 const bestSet = opEntry?.atlasDetail?.terminalSets[0];
                 const unfusedLoops = bestSet
@@ -250,13 +258,118 @@ export class MarkdownReporter {
 
                 if (!bm.succeeded) {
                     lines.push(
-                        `| \`${bm.opType}\` | FAIL (${bm.error}) | — | ${unfusedLoops ?? "—"} | — | — | — | ${unfusedInfra ?? "—"} | — |`,
+                        `| \`${bm.opType}\` | FAIL (${bm.error}) | — | — | ${unfusedLoops ?? "—"} | — | — | — | — | — | — | — |`,
                     );
                 } else {
+                    const barriersStr =
+                        bm.fusionBarrierOps.length > 0
+                            ? bm.fusionBarrierOps.map((b) => `\`${b}\``).join(", ")
+                            : "None";
+                    const variantsStr =
+                        bm.variants && bm.variants.length > 0
+                            ? bm.variants
+                                  .map((v) => {
+                                      const dl = v.loopCount - bm.loopCount;
+                                      const dt = v.totalOps - bm.totalOps;
+                                      const dlStr = dl === 0 ? "0" : dl > 0 ? `+${dl}` : `${dl}`;
+                                      const dtStr = dt === 0 ? "0" : dt > 0 ? `+${dt}` : `${dt}`;
+                                      return `\`${v.label}\`: ${v.loopCount}L (${dlStr}), ${v.controlMemoryViewCount} infra, ${v.totalOps} ops (${dtStr})`;
+                                  })
+                                  .join("<br>")
+                            : "—";
                     lines.push(
-                        `| \`${bm.opType}\` | PASS | **${bm.loopCount}** | ${unfusedLoops ?? "—"} | ${bm.scalarComputeCount} | ${bm.indexingScalarCount} | **${bm.controlMemoryViewCount}** | ${unfusedInfra ?? "—"} | ${bm.totalOps} |`,
+                        `| \`${bm.opType}\` | PASS | **${bm.loopCount}** | ${bm.maxLoopDepth} | ${unfusedLoops ?? "—"} | ${bm.scalarComputeCount} | ${bm.indexingScalarCount} | **${bm.controlMemoryViewCount}** | ${bm.infraPerComputeRatio.toFixed(2)} | ${barriersStr} | ${variantsStr} | ${bm.totalOps} |`,
                     );
                 }
+            }
+            lines.push(``);
+
+            const okBenchmarks = sortedBenchmarks.filter((b) => b.succeeded);
+            if (okBenchmarks.length > 0) {
+                const topLoops = [...okBenchmarks]
+                    .sort((a, b) => b.loopCount - a.loopCount || b.totalOps - a.totalOps)
+                    .slice(0, 15);
+                const topTotalOps = [...okBenchmarks]
+                    .sort((a, b) => b.totalOps - a.totalOps || b.loopCount - a.loopCount)
+                    .slice(0, 15);
+                const topInfraRatio = [...okBenchmarks]
+                    .filter((b) => b.totalOps > 1 || b.loopCount > 0)
+                    .sort(
+                        (a, b) =>
+                            b.infraPerComputeRatio - a.infraPerComputeRatio ||
+                            b.controlMemoryViewCount - a.controlMemoryViewCount,
+                    )
+                    .slice(0, 15);
+
+                lines.push(
+                    `### 6.2 Performance Hotspot Leaderboards (Fused Pipeline)`,
+                    `Top outliers in the fused CGRA lowering pipeline highlighting remaining loop-count, node-bloat, and indexing/control overhead pain points.`,
+                    ``,
+                    `#### Top 15 by Fused \`Loop\` Count`,
+                    `| Rank | Operator | Fused \`Loop\`s | Max Depth | Total Fused Ops | Fusion Barriers |`,
+                    `| :---: | :--- | :---: | :---: | :---: | :--- |`,
+                );
+                topLoops.forEach((bm, idx) => {
+                    const barriersStr =
+                        bm.fusionBarrierOps.length > 0
+                            ? bm.fusionBarrierOps.map((b) => `\`${b}\``).join(", ")
+                            : "None";
+                    lines.push(
+                        `| ${idx + 1} | \`${bm.opType}\` | **${bm.loopCount}** | ${bm.maxLoopDepth} | ${bm.totalOps} | ${barriersStr} |`,
+                    );
+                });
+                lines.push(
+                    ``,
+                    `#### Top 15 by Total Fused Ops`,
+                    `| Rank | Operator | Total Fused Ops | Fused \`Loop\`s | \`0D\` Compute | Indexing | Control/Mem/View |`,
+                    `| :---: | :--- | :---: | :---: | :---: | :---: | :---: |`,
+                );
+                topTotalOps.forEach((bm, idx) => {
+                    lines.push(
+                        `| ${idx + 1} | \`${bm.opType}\` | **${bm.totalOps}** | ${bm.loopCount} | ${bm.scalarComputeCount} | ${bm.indexingScalarCount} | ${bm.controlMemoryViewCount} |`,
+                    );
+                });
+                lines.push(
+                    ``,
+                    `#### Top 15 by Infra-per-Compute Ratio (\`(Indexing + Control/Mem/View) / max(1, 0D Compute)\`)`,
+                    `| Rank | Operator | Infra / 0D | \`0D\` Compute | Indexing | Control/Mem/View | Total Fused Ops |`,
+                    `| :---: | :--- | :---: | :---: | :---: | :---: | :---: |`,
+                );
+                topInfraRatio.forEach((bm, idx) => {
+                    lines.push(
+                        `| ${idx + 1} | \`${bm.opType}\` | **${bm.infraPerComputeRatio.toFixed(2)}** | ${bm.scalarComputeCount} | ${bm.indexingScalarCount} | ${bm.controlMemoryViewCount} | ${bm.totalOps} |`,
+                    );
+                });
+                lines.push(``);
+            }
+        }
+
+        // Section 6.3: Approximation Root-Cause Roadmap
+        if (report.approximationHotspots && report.approximationHotspots.length > 0) {
+            lines.push(
+                `### 6.3 Approximation Root-Cause Roadmap`,
+                `Traces each \`fully-lowerable-approx\` operator back to the non-native leaf primitive(s) making it approximate, identifying single-blocker leverage (operators that immediately become **Exact** if that single root is supported exactly).`,
+                ``,
+                `| Root Primitive | Approx Class | Approx Recipes | Transitive Dependents | Sole-Blocker Flips to Exact | Sole-Blocker Operators (Sample) | Transitive Sample |`,
+                `| :--- | :--- | :--- | :---: | :---: | :--- | :--- |`,
+            );
+            for (const entry of report.approximationHotspots) {
+                const recipesStr =
+                    entry.rootRecipes.map((r) => `\`${r}\``).join(", ") || "—";
+                const soleSample =
+                    entry.soleBlockerOps.length > 0
+                        ? entry.soleBlockerOps.slice(0, 6).map((o) => `\`${o}\``).join(", ") +
+                          (entry.soleBlockerOps.length > 6
+                              ? ` (+${entry.soleBlockerOps.length - 6} more)`
+                              : "")
+                        : "—";
+                const depSample =
+                    entry.sampleDependentOps.length > 0
+                        ? entry.sampleDependentOps.slice(0, 5).map((o) => `\`${o}\``).join(", ")
+                        : "—";
+                lines.push(
+                    `| \`${entry.rootOp}\` | \`${entry.approxClass}\` | ${recipesStr} | ${entry.transitiveDependentCount} | **${entry.soleBlockerOps.length}** | ${soleSample} | ${depSample} |`,
+                );
             }
             lines.push(``);
         }

@@ -11,6 +11,8 @@ import {
 import type {
     AbstractionLevelSummary,
     AnalyzedRecipe,
+    ApproximationClass,
+    ApproximationRootEntry,
     DialectHubEntry,
     DirectDecompositionDetail,
     DynamicHierarchyReport,
@@ -413,6 +415,7 @@ export class RecipeGraphAnalyzer {
 
         // 6. Compute fully dynamic, recipe-driven abstraction hierarchy
         const hierarchy = this.computeDynamicHierarchy(profile, operators, directRecipesByOp);
+        const approximationHotspots = this.computeApproximationHotspots(recipes, operators);
 
         return {
             profile,
@@ -422,7 +425,83 @@ export class RecipeGraphAnalyzer {
             prioritizedGaps,
             unimplementedSummary,
             hierarchy,
+            approximationHotspots,
         };
+    }
+
+    private computeApproximationHotspots(
+        recipes: AnalyzedRecipe[],
+        operators: Map<string, OperatorAnalysis>,
+    ): ApproximationRootEntry[] {
+        const recipeByName = new Map<string, AnalyzedRecipe>();
+        for (const r of recipes) recipeByName.set(r.name, r);
+
+        const classifyRoot = (rootOp: string): ApproximationClass => {
+            if (rootOp === "Div" || rootOp === "Reciprocal") return "rational-div";
+            if (rootOp === "Sqrt") return "algebraic-sqrt";
+            return "transcendental";
+        };
+
+        const rootStats = new Map<
+            string,
+            {
+                rootRecipes: Set<string>;
+                dependents: Set<string>;
+                soleBlockers: Set<string>;
+            }
+        >();
+
+        for (const op of operators.values()) {
+            if (op.status !== "fully-lowerable-approx" || !op.atlasDetail) continue;
+            const fullSet =
+                op.atlasDetail.terminalSets.find((s) => s.reachesFullScalar) ??
+                op.atlasDetail.terminalSets[0];
+            if (!fullSet) continue;
+
+            const approxRoots = new Map<string, string[]>();
+            for (const recName of fullSet.recipeChain) {
+                const rec = recipeByName.get(recName);
+                if (!rec || rec.precision !== "approximation") continue;
+                const rootOp = rec.targetOps[0] ?? String(rec.rawTarget);
+                const list = approxRoots.get(rootOp) ?? [];
+                list.push(recName);
+                approxRoots.set(rootOp, list);
+            }
+
+            if (approxRoots.size === 0) continue;
+            const isSoleBlocker = approxRoots.size === 1;
+
+            for (const [rootOp, rootRecNames] of approxRoots.entries()) {
+                let entry = rootStats.get(rootOp);
+                if (!entry) {
+                    entry = {
+                        rootRecipes: new Set<string>(),
+                        dependents: new Set<string>(),
+                        soleBlockers: new Set<string>(),
+                    };
+                    rootStats.set(rootOp, entry);
+                }
+                rootRecNames.forEach((rn) => entry!.rootRecipes.add(rn));
+                entry.dependents.add(op.opType);
+                if (isSoleBlocker) entry.soleBlockers.add(op.opType);
+            }
+        }
+
+        return Array.from(rootStats.entries())
+            .map(([rootOp, s]) => ({
+                rootOp,
+                rootRecipes: Array.from(s.rootRecipes).sort(),
+                approxClass: classifyRoot(rootOp),
+                transitiveDependentCount: s.dependents.size,
+                soleBlockerOps: Array.from(s.soleBlockers).sort(),
+                sampleDependentOps: Array.from(s.dependents).sort().slice(0, 12),
+            }))
+            .sort((a, b) => {
+                if (b.soleBlockerOps.length !== a.soleBlockerOps.length) {
+                    return b.soleBlockerOps.length - a.soleBlockerOps.length;
+                }
+                return b.transitiveDependentCount - a.transitiveDependentCount;
+            });
     }
 
     private detectRewriteCycles(

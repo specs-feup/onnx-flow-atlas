@@ -10,6 +10,7 @@ import {
     DataType,
     Recipes,
     IndexingMode,
+    Schedule,
     inferShapes,
     makeTensorProto,
     topologicalSortOperationNodes,
@@ -25,6 +26,7 @@ import type {
     AnalyzedRecipe,
     DynamicProbeResult,
     FusedLoweringMetrics,
+    FusedModeVariant,
     OpQuantityEntry,
     OpRole,
     TensorRankBucket,
@@ -73,63 +75,155 @@ export class DynamicProbeVerifier {
     public measureFusedBenchmarks(
         opTypes: string[] = DEFAULT_FUSED_BENCHMARK_OPS,
     ): FusedLoweringMetrics[] {
+        const computeMaxLoopDepth = (g: OnnxGraph.Class, depth: number = 0): number => {
+            let maxD = depth;
+            for (const op of g.getOperationNodes()) {
+                for (const sub of op.regions) {
+                    const subDepth = op.type === "Loop" ? depth + 1 : depth;
+                    maxD = Math.max(maxD, computeMaxLoopDepth(sub, subDepth));
+                }
+            }
+            return maxD;
+        };
+
+        const collectPipelineCounts = (
+            opType: string,
+            extraOpts: Record<string, unknown> = {},
+        ) => {
+            const { graph } = this.buildSyntheticSingleOpGraph(opType, undefined, 1);
+            const transformed = new OnnxGraphTransformer({
+                canonicalize: true,
+                loopLowering: true,
+                fuse: true,
+                coalesce: true,
+                recurse: true,
+                optimize: true,
+                decomposeForCgra: false,
+                indexingMode: IndexingMode.Pointer,
+                ...extraOpts,
+            }).apply(graph, false);
+
+            const bucketMap = new Map<string, OpQuantityEntry>();
+            const actualSet = new Set<string>();
+            this.collectEmittedOpsRecursively(transformed, 0, true, actualSet, bucketMap);
+
+            let loopCount = 0;
+            let scalarComputeCount = 0;
+            let nonScalarComputeCount = 0;
+            let indexingScalarCount = 0;
+            let controlMemoryViewCount = 0;
+            let totalOps = 0;
+
+            for (const entry of bucketMap.values()) {
+                totalOps += entry.count;
+                if (entry.opType === "Loop") loopCount += entry.count;
+                if (entry.role === "compute") {
+                    if (entry.rank === "0D") scalarComputeCount += entry.count;
+                    else nonScalarComputeCount += entry.count;
+                } else if (entry.role === "indexing") {
+                    indexingScalarCount += entry.count;
+                } else {
+                    controlMemoryViewCount += entry.count;
+                }
+            }
+
+            const barrierSet = new Set<string>();
+            for (const topOp of transformed.getOperationNodes()) {
+                if (topOp.type === "Loop") {
+                    const srcTypes = topOp.getMetadata("sourceOpTypes");
+                    if (Array.isArray(srcTypes)) {
+                        for (const t of srcTypes) {
+                            const s = String(t);
+                            if (
+                                s === "MatMul" ||
+                                s === "Conv" ||
+                                s === "MaxPool" ||
+                                s === "AveragePool" ||
+                                s === "Slice" ||
+                                s === "Concat" ||
+                                s === "Pad" ||
+                                s === "TopK" ||
+                                s === "ArgMax" ||
+                                s === "ArgMin" ||
+                                s === "Softmax" ||
+                                s === "LayerNormalization" ||
+                                s.startsWith("Reduce")
+                            ) {
+                                barrierSet.add(s);
+                            }
+                        }
+                    }
+                }
+            }
+
+            return {
+                loopCount,
+                maxLoopDepth: computeMaxLoopDepth(transformed, 0),
+                scalarComputeCount,
+                nonScalarComputeCount,
+                indexingScalarCount,
+                controlMemoryViewCount,
+                infraPerComputeRatio:
+                    (indexingScalarCount + controlMemoryViewCount) /
+                    Math.max(1, scalarComputeCount),
+                fusionBarrierOps: Array.from(barrierSet).sort(),
+                totalOps,
+            };
+        };
+
         return opTypes.map((opType) => {
             try {
-                const { graph } = this.buildSyntheticSingleOpGraph(opType, undefined, 1);
-                const transformed = new OnnxGraphTransformer({
-                    canonicalize: true,
-                    loopLowering: true,
-                    fuse: true,
-                    coalesce: true,
-                    recurse: true,
-                    optimize: true,
-                    decomposeForCgra: false,
-                    indexingMode: IndexingMode.Pointer,
-                }).apply(graph, false);
+                const base = collectPipelineCounts(opType);
+                const variants: FusedModeVariant[] = [];
 
-                const bucketMap = new Map<string, OpQuantityEntry>();
-                const actualSet = new Set<string>();
-                this.collectEmittedOpsRecursively(transformed, 0, true, actualSet, bucketMap);
+                if (base.loopCount > 0) {
+                    const scanRes = collectPipelineCounts(opType, { useScanOutputs: true });
+                    variants.push({
+                        label: "scan_outputs",
+                        loopCount: scanRes.loopCount,
+                        controlMemoryViewCount: scanRes.controlMemoryViewCount,
+                        totalOps: scanRes.totalOps,
+                    });
+                }
 
-                let loopCount = 0;
-                let scalarComputeCount = 0;
-                let nonScalarComputeCount = 0;
-                let indexingScalarCount = 0;
-                let controlMemoryViewCount = 0;
-                let totalOps = 0;
-
-                for (const entry of bucketMap.values()) {
-                    totalOps += entry.count;
-                    if (entry.opType === "Loop") loopCount += entry.count;
-                    if (entry.role === "compute") {
-                        if (entry.rank === "0D") scalarComputeCount += entry.count;
-                        else nonScalarComputeCount += entry.count;
-                    } else if (entry.role === "indexing") {
-                        indexingScalarCount += entry.count;
-                    } else {
-                        controlMemoryViewCount += entry.count;
-                    }
+                if (opType === "Softmax" || opType === "LayerNormalization" || opType === "LogSoftmax" || opType === "RMSNormalization") {
+                    const loopRecipeName =
+                        opType === "Softmax"
+                            ? "LowerSoftmaxLoop"
+                            : opType === "LogSoftmax"
+                              ? "LowerLogSoftmaxLoop"
+                              : opType === "RMSNormalization"
+                                ? "LowerRMSNormLoop"
+                                : "LowerLayerNormLoop";
+                    const schedRes = collectPipelineCounts(opType, {
+                        schedule: new Schedule().useRecipe(opType, loopRecipeName),
+                    });
+                    variants.push({
+                        label: loopRecipeName,
+                        loopCount: schedRes.loopCount,
+                        controlMemoryViewCount: schedRes.controlMemoryViewCount,
+                        totalOps: schedRes.totalOps,
+                    });
                 }
 
                 return {
                     opType,
                     succeeded: true,
-                    loopCount,
-                    scalarComputeCount,
-                    nonScalarComputeCount,
-                    indexingScalarCount,
-                    controlMemoryViewCount,
-                    totalOps,
+                    ...base,
+                    variants,
                 };
             } catch (err) {
                 return {
                     opType,
                     succeeded: false,
                     loopCount: 0,
+                    maxLoopDepth: 0,
                     scalarComputeCount: 0,
                     nonScalarComputeCount: 0,
                     indexingScalarCount: 0,
                     controlMemoryViewCount: 0,
+                    infraPerComputeRatio: 0,
+                    fusionBarrierOps: [],
                     totalOps: 0,
                     error: err instanceof Error ? err.message : String(err),
                 };
@@ -244,6 +338,30 @@ export class DynamicProbeVerifier {
             }
 
             const outerBuilder = new GraphBuilder(graph, `probe_outer_${recipe.name}_${testOp}`);
+
+            if (recipe.lowerStandalone) {
+                recipe.lowerStandalone(opNode, outerBuilder, IndexingMode.Pointer);
+                if (graph.hasNode(opNode.id)) {
+                    outerBuilder.removeNode(opNode);
+                }
+                try {
+                    inferShapes(graph);
+                } catch {
+                    // Non-fatal
+                }
+                const bucketMap = new Map<string, OpQuantityEntry>();
+                const actualSet = new Set<string>();
+                this.collectEmittedOpsRecursively(graph, 0, true, actualSet, bucketMap);
+                return this.finalizeProbeResult(
+                    recipe.name,
+                    testOp,
+                    `${probeInputSummary} [Nested/Standalone]`,
+                    analyzed.declaredProducedOps,
+                    actualSet,
+                    bucketMap,
+                );
+            }
+
             const body = OnnxGraph.create();
             const innerBuilder = new GraphBuilder(body, `probe_body_${recipe.name}_${testOp}`);
 
@@ -469,13 +587,23 @@ export class DynamicProbeVerifier {
                 outDtype = DataType.UINT8;
                 break;
             case "Conv":
-                inputs = [
-                    makeInput("X", DataType.FLOAT, [1, 3, 8, 8]),
-                    makeInput("W", DataType.FLOAT, [4, 3, 3, 3]),
-                    makeInput("B", DataType.FLOAT, [4]),
-                ];
-                attrs = { kernel_shape: [3, 3], strides: [1, 1], pads: [0, 0, 0, 0] };
-                outShape = [1, 4, 6, 6];
+                if (recipeName === "LowerConv1x1ToMatMul") {
+                    inputs = [
+                        makeInput("X", DataType.FLOAT, [1, 3, 8, 8]),
+                        makeInput("W", DataType.FLOAT, [4, 3, 1, 1]),
+                        makeInput("B", DataType.FLOAT, [4]),
+                    ];
+                    attrs = { kernel_shape: [1, 1], strides: [1, 1], pads: [0, 0, 0, 0] };
+                    outShape = [1, 4, 8, 8];
+                } else {
+                    inputs = [
+                        makeInput("X", DataType.FLOAT, [1, 3, 8, 8]),
+                        makeInput("W", DataType.FLOAT, [4, 3, 3, 3]),
+                        makeInput("B", DataType.FLOAT, [4]),
+                    ];
+                    attrs = { kernel_shape: [3, 3], strides: [1, 1], pads: [0, 0, 0, 0] };
+                    outShape = [1, 4, 6, 6];
+                }
                 break;
             case "ConvInteger":
                 inputs = [
@@ -830,6 +958,16 @@ export class DynamicProbeVerifier {
                 outShape = [4, 2, 3];
                 break;
             case "ReduceSum":
+                if (recipeName === "LowerReduceSumNoop") {
+                    inputs = [
+                        makeInput("X", DataType.FLOAT, [4, 8]),
+                        builder.createConstant("axes", makeTensorProto(DataType.INT64, [0], [])),
+                    ];
+                    attrs = { keepdims: 1, noop_with_empty_axes: 1 };
+                    outShape = [4, 8];
+                    break;
+                }
+            // fall through
             case "ReduceMean":
             case "ReduceMax":
             case "ReduceMin":
@@ -878,10 +1016,25 @@ export class DynamicProbeVerifier {
             case "LessOrEqual": {
                 const isBool = opType === "And" || opType === "Or" || opType === "Xor";
                 const dt = isBool ? DataType.BOOL : DataType.FLOAT;
-                inputs = [
-                    makeInput("A", dt, [4, 4]),
-                    makeInput("B", dt, [4, 4]),
-                ];
+                if (
+                    opType === "Div" &&
+                    (recipeName === "LowerDivByConstant" || recipeName === "LowerDivByExactPowerOfTwo")
+                ) {
+                    inputs = [
+                        makeInput("A", DataType.FLOAT, [4, 4]),
+                        builder.createConstant("B_const", makeTensorProto(DataType.FLOAT, [], [2.0])),
+                    ];
+                } else if (opType === "Pow" && recipeName === "LowerPowSmallInt") {
+                    inputs = [
+                        makeInput("A", DataType.FLOAT, [4, 4]),
+                        builder.createConstant("B_exp", makeTensorProto(DataType.FLOAT, [], [2.0])),
+                    ];
+                } else {
+                    inputs = [
+                        makeInput("A", dt, [4, 4]),
+                        makeInput("B", dt, [4, 4]),
+                    ];
+                }
                 if (recipeName === "LowerVariadicMin" || recipeName === "LowerVariadicMax") {
                     inputs.push(makeInput("C", dt, [4, 4]));
                 }
@@ -905,8 +1058,62 @@ export class DynamicProbeVerifier {
                 attrs = { axis: 0 };
                 outShape = [4, 4];
                 break;
+            case "Mean":
+            case "Sum":
+                inputs = [
+                    makeInput("A", DataType.FLOAT, [4, 4]),
+                    makeInput("B", DataType.FLOAT, [4, 4]),
+                ];
+                outShape = [4, 4];
+                break;
+            case "Split":
+                inputs = [makeInput("X", DataType.FLOAT, [4, 4])];
+                attrs = { axis: 0 };
+                outputNames = ["Y0", "Y1"];
+                outShape = [2, 4];
+                break;
             case "Round":
                 inputs = [makeInput("X", DataType.FLOAT, [4, 4])];
+                break;
+            case "RMSNormalization":
+                inputs = [
+                    makeInput("X", DataType.FLOAT, [2, 1, 2, 4]),
+                    makeInput("Scale", DataType.FLOAT, [4]),
+                ];
+                attrs = { axis: -1, epsilon: 1e-5 };
+                outShape = [2, 1, 2, 4];
+                break;
+            case "RotaryEmbedding":
+                inputs = [
+                    makeInput("X", DataType.FLOAT, [1, 2, 4, 4]),
+                    makeInput("cos_cache", DataType.FLOAT, [4, 2]),
+                    makeInput("sin_cache", DataType.FLOAT, [4, 2]),
+                ];
+                attrs = { interleaved: 0 };
+                outShape = [1, 2, 4, 4];
+                break;
+            case "Attention":
+                inputs = [
+                    makeInput("Q", DataType.FLOAT, [1, 2, 4, 4]),
+                    makeInput("K", DataType.FLOAT, [1, 2, 4, 4]),
+                    makeInput("V", DataType.FLOAT, [1, 2, 4, 4]),
+                ];
+                attrs = { q_num_heads: 2, kv_num_heads: 2 };
+                outShape = [1, 2, 4, 4];
+                break;
+            case "SpaceToDepth":
+                inputs = [makeInput("X", DataType.FLOAT, [1, 4, 4, 4])];
+                attrs = { blocksize: 2 };
+                outShape = [1, 16, 2, 2];
+                break;
+            case "TensorScatter":
+                inputs = [
+                    makeInput("past_cache", DataType.FLOAT, [1, 2, 4, 4]),
+                    makeInput("update", DataType.FLOAT, [1, 2, 2, 4]),
+                    makeInput("write_indices", DataType.INT64, [1]),
+                ];
+                attrs = { axis: -2, mode: "circular" };
+                outShape = [1, 2, 4, 4];
                 break;
             default:
                 inputs = [

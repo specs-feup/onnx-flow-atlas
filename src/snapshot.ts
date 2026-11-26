@@ -25,13 +25,17 @@ export async function generateFullSnapshot(outDir: string = "atlas"): Promise<vo
     // Run dynamic verification across BOTH canonicalization and loop-lowering recipes
     const verifier = new DynamicProbeVerifier();
     verifier.verifyAllRecipes(recipes);
-    const fusedBenchmarks = verifier.measureFusedBenchmarks();
-
     // 1. Analyze Scalar CGRA Profile (Primary)
     console.log(`[Snapshot] Generating Scalar-CGRA full report & maps...`);
     const cgraProfile = BUILTIN_PROFILES["scalar-cgra"];
+    const baseCgraReport = analyzer.analyze(cgraProfile, recipes);
+    const allBenchmarkOps = Array.from(baseCgraReport.operators.values())
+        .filter((o) => o.atlasDetail !== undefined && !o.isNativePrimitive)
+        .map((o) => o.opType)
+        .sort();
+    const fusedBenchmarks = verifier.measureFusedBenchmarks(allBenchmarkOps);
     const cgraReport = {
-        ...analyzer.analyze(cgraProfile, recipes),
+        ...baseCgraReport,
         fusedBenchmarks,
     };
 

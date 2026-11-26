@@ -182,16 +182,42 @@ export interface UnimplementedSummary {
     readonly byCategory: Record<string, string[]>;
 }
 
+export interface FusedModeVariant {
+    readonly label: string;
+    readonly loopCount: number;
+    readonly controlMemoryViewCount: number;
+    readonly totalOps: number;
+}
+
 export interface FusedLoweringMetrics {
     readonly opType: string;
     readonly succeeded: boolean;
     readonly loopCount: number;
+    readonly maxLoopDepth: number;
     readonly scalarComputeCount: number;
     readonly nonScalarComputeCount: number;
     readonly indexingScalarCount: number;
     readonly controlMemoryViewCount: number;
+    readonly infraPerComputeRatio: number;
+    readonly fusionBarrierOps: string[];
+    readonly variants?: FusedModeVariant[];
     readonly totalOps: number;
     readonly error?: string;
+}
+
+export type ApproximationClass =
+    | "rational-div"
+    | "algebraic-sqrt"
+    | "transcendental";
+
+export interface ApproximationRootEntry {
+    readonly rootOp: string;
+    readonly rootRecipes: string[];
+    readonly approxClass: ApproximationClass;
+    readonly transitiveDependentCount: number;
+    /** Higher-level approx ops whose Best Set depends ONLY on this root for approximation */
+    readonly soleBlockerOps: string[];
+    readonly sampleDependentOps: string[];
 }
 
 export interface LibraryAnalysisReport {
@@ -204,6 +230,7 @@ export interface LibraryAnalysisReport {
     /** Standard ONNX operators from OpRegistry with no recipes and not native */
     readonly unimplementedSummary: UnimplementedSummary;
     readonly hierarchy: DynamicHierarchyReport;
+    readonly approximationHotspots?: ApproximationRootEntry[];
     readonly fusedBenchmarks?: FusedLoweringMetrics[];
 }
 
